@@ -29,11 +29,45 @@ else:
         headers = {"Authorization": f"Bearer {st.session_state['token']}"}
         
         with st.chat_message("assistant"):
-            res = requests.post(f"{API_URL}/chat", json={"query": query}, headers=headers)
+            # Create a placeholder for the live updates
+            status_placeholder = st.empty()
+            response_placeholder = st.empty()
+            status_placeholder.caption("Packaging query for backend...")
             
-        if res.status_code == 200:
-            data = res.json()
-            st.chat_message("assistant").write(data["reply"])
-            st.caption(f"Domain Routed: {data['domain']}")
-        else:
-            st.error("API Error")
+            # Add stream=True to keep the connection open and read chunks
+            res = requests.post(f"{API_URL}/chat", json={"query": query}, headers=headers, stream=True)
+            
+            final_reply = ""
+            final_domain = ""
+
+            if res.status_code == 200:
+                # Iterate over the raw bytes coming from the SSE backend
+                for line in res.iter_lines():
+                    if line:
+                        # Decode bytes to string and strip the "data: " prefix
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith("data: "):
+                            data_str = decoded_line.replace("data: ", "")
+                            import json
+                            data = json.loads(data_str)
+                            
+                            # Handle potential backend errors
+                            if "error" in data:
+                                st.error(f"Agent Error: {data['error']}")
+                                break
+                            
+                            # Update the UI with the live node status
+                            status_placeholder.caption(f"🔄 {data['status']}")
+                            
+                            # Capture the final text if it's populated
+                            if data.get("reply"):
+                                final_reply = data["reply"]
+                                final_domain = data["domain"]
+                
+                # Once the stream finishes, clear the status and show the final answer
+                status_placeholder.empty()
+                response_placeholder.write(final_reply)
+                st.caption(f"Domain Routed: {final_domain}")
+                
+            else:
+                st.error("API Error")

@@ -5,6 +5,11 @@ import uvicorn
 import json
 from fastapi.responses import StreamingResponse
 from main import graph as langgraph_app # This is your Compiled Graph
+from langchain_core.messages import AIMessageChunk
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 # This is the actual server
 backend = FastAPI()
@@ -15,52 +20,139 @@ USERS_DB = {
     "chelsea_scout": "football24"   # Scout
 }
 
+# ============================================================================
+# SSE UTILITIES
+# ============================================================================
+
+def format_sse_event(event_type: str, data: dict) -> str:
+    """
+    Format event as Server-Sent Events (SSE).
+
+    Format: data: <json>\n\n
+    """
+    sse_event = {
+        "type": event_type,
+        "timestamp": datetime.utcnow().isoformat(),
+        "data": data
+    }
+    return f"data: {json.dumps(sse_event)}\n\n"
+
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
 # Matches your Frontend's login attempt
 @backend.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user_password = USERS_DB.get(form_data.username)
-    
+
     if not user_password or form_data.password != user_password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     # In a real app, we'd generate a real JWT token here.
     # For your demo, we just return a success string.
     return {"access_token": f"session_for_{form_data.username}", "token_type": "bearer"}
 
-# Matches your Frontend's 'requests.post' chat call
+
+# ============================================================================
+# CHAT REQUEST MODEL
+# ============================================================================
+
 class ChatRequest(BaseModel):
     query: str
 
+
+# ============================================================================
+# DUAL-STREAM SSE ENDPOINT
+# ============================================================================
+
 @backend.post("/chat")
 async def chat(request: ChatRequest):
+    """
+    Dual-stream SSE endpoint with updates (node trace) + messages (tokens).
+
+    Uses astream() with stream_mode=["updates", "messages"] to emit:
+    1. "update" events: Node execution trace (thought process)
+    2. "message" events: LLM token chunks (incremental response)
+    """
     def event_generator():
-        yield f"data: {json.dumps({'status': 'Connected to TWG Server. Initializing...'})}\n\n"
-        initial_state = {"query": request.query}
-        
+        # Initial connection message
+        yield format_sse_event("status", {"message": "🚀 Connected to TWG Server. Initializing..."})
+
+        initial_state = {
+            "messages": [],
+            "query": request.query,
+            "user_role": "user",
+            "domain_detected": "",
+            "final_response": ""
+        }
+
         try:
-            # .stream() yields updates as each node finishes
-            for output in langgraph_app.stream(initial_state):
-                for node_name, state_update in output.items():
-                    # Format the payload for Server-Sent Events
-                    payload = {
-                        "node": node_name,
-                        "status": f"Finished processing in {node_name}...",
-                        "reply": state_update.get("final_response", ""),
-                        "domain": state_update.get("domain_detected", "")
-                    }
-                    # SSE format requires "da ta: <json_string>\n\n"
-                    yield f"data: {json.dumps(payload)}\n\n"
-                    
+            # Async streaming with dual modes: updates (node trace) + messages (tokens)
+            for stream_type, data in langgraph_app.stream(
+                initial_state,
+                stream_mode=["updates", "messages"]
+            ):
+
+                # ================================================================
+                # STREAM 1: UPDATES (Node Execution Trace)
+                # ================================================================
+                if stream_type == "updates":
+                    # data = {node_name: {state_update}}
+                    for node_name, node_state in data.items():
+                        logger.info(f"🧠 Node: {node_name}")
+
+                        # Emit node update event (thought trace)
+                        yield format_sse_event(
+                            "update",
+                            {
+                                "node": node_name,
+                                "status": "executing",
+                                "timestamp": datetime.utcnow().isoformat()
+                            }
+                        )
+
+                # ================================================================
+                # STREAM 2: MESSAGES (Token Stream)
+                # ================================================================
+                elif stream_type == "messages":
+                    # data = [AIMessageChunk(...), AIMessageChunk(...), ...]
+                    for message_chunk in data:
+                        if isinstance(message_chunk, AIMessageChunk):
+                            token = message_chunk.content
+
+                            # Emit token event for incremental rendering
+                            if token:
+                                yield format_sse_event(
+                                    "message",
+                                    {
+                                        "token": token,
+                                        "is_final": False
+                                    }
+                                )
+
+            # Signal completion
+            yield format_sse_event("message", {"token": "", "is_final": True})
+            logger.info("✅ Stream completed")
+
         except Exception as e:
-            error_payload = {"error": str(e)}
-            yield f"data: {json.dumps(error_payload)}\n\n"
+            logger.error(f"❌ Stream error: {str(e)}")
+            yield format_sse_event("error", {"message": str(e)})
 
     # Return the stream with the correct SSE media type
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable proxy buffering
+        }
+    )
 
 if __name__ == "__main__":
     # Runs the server on port 8000

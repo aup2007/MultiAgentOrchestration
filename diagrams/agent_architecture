@@ -1,0 +1,61 @@
+digraph LangGraph_Agent_Architecture {
+	nodesep=0.5 rankdir=TB ranksep=0.8 splines=ortho
+	fontsize=20 label="Supervisor + Subgraph Agent Architecture" labelloc=t
+	node [color="#7C3AED" fillcolor="#F8F5FF" fontname=Helvetica shape=box style="rounded,filled"]
+	edge [arrowsize=0.8 color="#444444"]
+	start [label=START fillcolor="#EDE9FE" shape=oval]
+	end [label=END fillcolor="#EDE9FE" shape=oval]
+	subgraph cluster_shared {
+		color="#C4B5FD" fillcolor="#FAF5FF" label="Shared / Supervisor State" style="rounded,filled"
+		shared_state [label="AgentState
+- messages
+- query
+- user_role
+- domain_detected
+- final_response" fillcolor="#FFFFFF" shape=note]
+	}
+	subgraph cluster_supervisor {
+		color="#A78BFA" fillcolor="#F5F3FF" label="Supervisor Layer" style="rounded,filled"
+		input_guard [label="Input / Preprocess"]
+		supervisor [label="Supervisor Router"]
+		route_check [label="Route by domain_detected?" color="#D97706" fillcolor="#FEF3C7" shape=diamond]
+	}
+	subgraph cluster_f1 {
+		color="#86EFAC" fillcolor="#F0FDF4" label="F1 Subgraph" style="rounded,filled"
+		f1_state [label="F1SubState
+- query
+- year
+- location
+- f1_response" color="#16A34A" fillcolor="#FFFFFF" shape=note]
+		f1_extract [label="Extract Params
+(year, location)"]
+		f1_validate [label="Validate Params" color="#D97706" fillcolor="#FEF3C7" shape=diamond]
+		f1_sync [label="Sync / Normalize"]
+		f1_sql [label="SQL Query"]
+		f1_format [label="Format F1 Result"]
+		f1_return [label="Return to Supervisor"]
+	}
+	subgraph cluster_other {
+		color="#CBD5E1" fillcolor="#F8FAFC" label="Other Domain Agent(s)" style="rounded,dashed"
+		other_agent [label="Other Agent / Subgraph" fillcolor="#FFFFFF"]
+	}
+	finalize [label="Finalize Response"]
+	start -> input_guard
+	input_guard -> supervisor
+	supervisor -> route_check
+	shared_state -> supervisor [label="read/write state" style=dashed]
+	shared_state -> f1_extract [label=query style=dashed]
+	f1_return -> shared_state [label="update final_response" style=dashed]
+	route_check -> f1_extract [label=F1]
+	route_check -> other_agent [label=Other]
+	other_agent -> finalize
+	f1_state -> f1_extract [style=dashed]
+	f1_extract -> f1_validate
+	f1_validate -> f1_sync [label=valid]
+	f1_validate -> f1_extract [label="missing / retry"]
+	f1_sync -> f1_sql
+	f1_sql -> f1_format
+	f1_format -> f1_return
+	f1_return -> finalize
+	finalize -> end
+}

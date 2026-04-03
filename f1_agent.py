@@ -2,7 +2,7 @@ import os
 import json
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from state import AgentState
 from db_utils import engine, ensure_f1_partition
 from dotenv import load_dotenv
@@ -14,77 +14,115 @@ import sqlalchemy.exc
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
 from langgraph.graph import StateGraph, START, END
-from typing import Any
+from typing import Any, Literal
 from typing import TypedDict
+import logging
+from tenacity import retry, wait_exponential, stop_after_attempt
 
-# This is the ONLY state these 3 nodes will care about
+logger = logging.getLogger(__name__)
+
+# === STATE DEFINITION ===
 class F1SubState(TypedDict):
     query: str
     entities: dict[str, Any]
     final_response: str
+    db_query_result: str  # Result from Text-to-SQL
+    fetch_attempts: int  # Track number of API fetch attempts
+    data_synced: bool  # Flag: has data been synced in this cycle?
 
 load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
+
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=100)
+sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000)
+
+
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
-f1_db = SQLDatabase(engine)
+f1_db = SQLDatabase(engine, include_tables=["f1_telemetry"])
+
+# Use the same SQL agent for querying
 f1_sql_executor = create_sql_agent(
-    llm=llm, 
-    db=f1_db, 
-    agent_type="openai-tools", 
+    llm=sql_llm,
+    db=f1_db,
+    agent_type="openai-tools",
     verbose=True
 )
 
 
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10), 
+    stop=stop_after_attempt(3),
+    reraise=True
+)
+def safe_extract_invoke(prompt_content: str):
+    return extract_llm.invoke([HumanMessage(content=prompt_content)]).content
 
+# Safe wrapper for the LangChain SQL Agent
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10), 
+    stop=stop_after_attempt(3),
+    reraise=True
+)
+def safe_sql_invoke(prompt_dict: dict):
+    return f1_sql_executor.invoke(prompt_dict)
+
+
+
+# === TOOLS ===
+
+@tool
+def sync_telemetry_tool(year: int, location: str, session_type: str = "R") -> str:
+    """
+    Downloads F1 telemetry from FastF1 API and syncs to Neon PostgreSQL.
+    Returns success/failure message.
+
+    Args:
+        year: Race year (e.g., 2024)
+        location: Race location (e.g., "Monaco")
+        session_type: "R" for Race, "FP1", "FP2", "FP3", "Q" for Qualifying
+    """
+    return sync_telemetry_to_neon(year, location, session_type)
 
 
 def check_if_data_exists(year: int, location: str):
     """Checks the Cloud DB to see if we already synced this race."""
-
     try:
         query = text("""
-            SELECT COUNT(*) FROM f1_telemetry 
+            SELECT COUNT(*) FROM f1_telemetry
             WHERE year = :y AND event_name = :loc
         """)
         with engine.connect() as conn:
             count = conn.execute(query, {"y": year, "loc": location}).scalar()
         return count > 0
     except Exception as e:
-        print(">>> [DB NOTICE] Table 'f1_telemetry' missing. Treating as a cache miss.")
+        logger.warning(f"Table 'f1_telemetry' check failed: {e}")
         return False
 
 
-
-def sync_telemetry_to_neon(year: int, location: str, session_type: str):
+def sync_telemetry_to_neon(year: int, location: str, session_type: str) -> str:
     """
     Downloads F1 data to RAM and executes the SQL push to Neon Cloud.
+    Returns a status message.
     """
-    print(f">>> [F1-SYNC] Streaming {year} {location} telemetry to Neon Cloud (Stateless)...")
-    
+    print(f">>> [F1-SYNC] Streaming {year} {location} telemetry to Neon Cloud...")
+
     Cache.set_disabled()
-    
+
     try:
         # 1. Load data into RAM
         session = fastf1.get_session(year, location, session_type)
         session.load(laps=True, telemetry=False, weather=False)
-        
-        # 2. Infrastructure Check (Using your existing function)
+
+        # 2. Infrastructure Check
         ensure_f1_partition(year, engine)
-        
-        # 3. FIX: Create a CLEAN DataFrame that matches your Postgres schema EXACTLY
+
+        # 3. Create DataFrame matching Postgres schema
         laps_raw = session.laps.copy()
         df_to_sync = pd.DataFrame()
-        
+
         df_to_sync['year'] = [year] * len(laps_raw)
         df_to_sync['event_name'] = [location] * len(laps_raw)
-        # df_to_sync['driver'] = laps_raw['Driver']       # Map 'Driver' to 'driver'
-        # df_to_sync['team'] = laps_raw['Team']           # Map 'Team' to 'team'
-        # df_to_sync['lap_number'] = laps_raw['LapNumber']
-        
-        # # CORRECTED: Pull from 'LapTime' (API) to 'lap_time_seconds' (DB)
-        # df_to_sync['lap_time_seconds'] = laps_raw['LapTime'].dt.total_seconds()
-
         df_to_sync['time_seconds'] = laps_raw['Time'].dt.total_seconds()
         df_to_sync['lap_time_seconds'] = laps_raw['LapTime'].dt.total_seconds()
         df_to_sync['pit_out_time_seconds'] = laps_raw['PitOutTime'].dt.total_seconds()
@@ -96,11 +134,8 @@ def sync_telemetry_to_neon(year: int, location: str, session_type: str):
         df_to_sync['sector2_session_time_seconds'] = laps_raw['Sector2SessionTime'].dt.total_seconds()
         df_to_sync['sector3_session_time_seconds'] = laps_raw['Sector3SessionTime'].dt.total_seconds()
         df_to_sync['lap_start_time_seconds'] = laps_raw['LapStartTime'].dt.total_seconds()
-        
-        # Datetime column
+
         df_to_sync['lap_start_date'] = laps_raw['LapStartDate']
-        
-        # Standard Data Mapping (Strings, Booleans, Numerics)
         df_to_sync['driver'] = laps_raw['Driver']
         df_to_sync['driver_number'] = laps_raw['DriverNumber']
         df_to_sync['lap_number'] = laps_raw['LapNumber']
@@ -120,224 +155,288 @@ def sync_telemetry_to_neon(year: int, location: str, session_type: str):
         df_to_sync['deleted_reason'] = laps_raw['DeletedReason']
         df_to_sync['fastf1_generated'] = laps_raw['FastF1Generated']
         df_to_sync['is_accurate'] = laps_raw['IsAccurate']
-        
-        # 4. EXECUTE: The "Upload" to Neon
-        try: 
+
+        # 4. Execute upload to Neon
+        try:
             df_to_sync.to_sql(
-                'f1_telemetry', 
-                engine, 
-                if_exists='append', 
+                'f1_telemetry',
+                engine,
+                if_exists='append',
                 index=False,
                 chunksize=500
             )
-            print(">> Data inserted <<")
+            msg = f"✅ Successfully synced {year} {location} ({len(df_to_sync)} laps) to Neon."
+            print(f">>> {msg}")
+            return msg
         except sqlalchemy.exc.SQLAlchemyError as db_err:
             original_error = getattr(db_err, 'orig', db_err)
-            print("\n" + "="*50)
-            print(" CLEAN DATABASE ERROR REPORT ")
-            print("="*50)
-            print(f"ERROR DETAILS:\n{original_error}")
-            print("="*50 + "\n")
-            
-            # Raise a clean, short error so the LangGraph agent doesn't print the data payload either
-            raise Exception(f"DB Insert Failed: {original_error}")
-        return laps_raw.pick_fastest()
+            error_msg = f"❌ DB Insert Failed: {original_error}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+    except Exception as e:
+        error_msg = f"❌ Sync failed: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
     finally:
         Cache.set_enabled()
 
 
-def f1_extract_node(state: F1SubState):
-    """Node 1: Extracts the year and location, checks for missing context."""
-    print("--- NODE 1: Extraction ---")
-    
-    extraction_prompt = f"""
-    Analyze: "{state['query']}"
-    Extract all relevant F1 entities (year, driver, event_name, team, lap_number).
-    Respond with ONLY a JSON object.
+# === NODES ===
+
+def f1_extract_node(state: F1SubState) -> dict:
     """
-    
-    response = llm.invoke([HumanMessage(content=extraction_prompt)]).content
-    
+    NODE 1: Extracts entities (year, location, driver) from user query.
+    No routing logic here—just extraction.
+    """
+    print("--- NODE 1: Entity Extraction ---")
+
+    extraction_prompt = f"""
+    Analyze this F1 query: "{state['query']}"
+    Extract all relevant F1 entities:
+    - year (as integer, e.g., 2024)
+    - event_name (race location, e.g., "Monaco")
+    - driver (driver name or code)
+    - team (team name)
+    - lap_number (if mentioned)
+
+    Respond with ONLY a JSON object. If a field is not found, use null.
+    Example: {{"year": 2024, "event_name": "Monaco", "driver": "Hamilton", "team": null, "lap_number": null}}
+    """
+
+    # response = llm.invoke([HumanMessage(content=extraction_prompt)]).content
+    response = safe_extract_invoke(extraction_prompt)
+
     try:
         entities = json.loads(response)
     except json.JSONDecodeError:
-        entities = {"year": None, "location": None}
+        logger.warning(f"Failed to parse extraction response: {response}")
+        entities = {"year": None, "event_name": None, "driver": None, "team": None, "lap_number": None}
 
-    return {"entities": entities}
-        
-    # year = data.get("year")
-    # location = data.get("location")
-    
-    # # EARLY EXIT CHECK: Catch missing data immediately
-    # if not year or not location:
-    #     return {
-    #         "year": year, 
-    #         "location": location,
-    #         "final_response": "Could you please specify the year and the race location? (For example: '2024 Monaco')",
-    #         "domain_detected": "f1"
-    #     }
-    
-    # return {
-    #     "year": year, 
-    #     "location": location
-    # }
+    return {"entities": entities, "fetch_attempts": 0, "data_synced": False}
 
 
-def f1_sync_node(state: F1SubState):
-    """Node 2: Checks the DB and downloads FastF1 data if missing."""
-    print("--- NODE 2: Database Sync ---")
-    
+def f1_query_db_node(state: F1SubState) -> dict:
+    """
+    NODE 2: Query the database using Text-to-SQL.
+    The LLM agent will recognize if the result is empty and decide whether to fetch.
+    This is where the agentic loop starts.
+    """
+    print("--- NODE 2: Query Database (Text-to-SQL) ---")
+
+    entities = state.get("entities", {})
+    query_text = state.get("query", "")
+    year = entities.get("year")
+    event_name = entities.get("event_name")
+    driver = entities.get("driver")
+
+    if year and event_name and driver:
+        try:
+            exists_query = text("""
+                SELECT COUNT(*)
+                FROM f1_telemetry
+                WHERE year = :year
+                AND event_name ILIKE :event_name
+                AND driver = :driver
+            """)
+            with engine.connect() as conn:
+                count = conn.execute(
+                    exists_query,
+                    {
+                        "year": year,
+                        "event_name": f"%{event_name}%",
+                        "driver": driver[:3].upper()
+                    }
+                ).scalar()
+
+            if not count:
+                return {
+                    "db_query_result": "NO_DATA_IN_DB",
+                    "data_synced": False
+                }
+        except Exception as e:
+            logger.error(f"Existence check failed: {e}")
+
+    # Build context for the SQL agent
+    context = json.dumps(entities)
+    agent_prompt = (
+        f"You are a TWG Global F1 Analyst. Answer this query: '{query_text}'\n\n"
+        f"Context Entities: {context}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"1. In f1_telemetry,the driver column stores 3-letter driver codes (e.g. HAM, VER, LEC), not full driver names.\n"
+        f"2. Query the 'f1_telemetry' table for lap-by-lap data.\n"
+        f"3. Use the provided entities to filter (e.g., WHERE year = {entities.get('year')} AND event_name = '{entities.get('event_name')}').\n"
+        f"4. If the table returns NO results or is empty, report 'NO_DATA_IN_DB'.\n"
+        f"5. If the table HAS data, provide a professional summary.\n"
+        f"6. If you can't find the answer in the database, say so clearly."
+    )
+
+    try:
+        # result = f1_sql_executor.invoke({"input": agent_prompt})
+        result = safe_sql_invoke({"input": agent_prompt})
+        db_result = result["output"]
+        print(f">>> SQL Query Result: {db_result[:200]}...")  # First 200 chars
+    except Exception as e:
+        logger.error(f"SQL execution failed: {e}")
+        db_result = f"ERROR: {str(e)}"
+
+    return {"db_query_result": db_result,
+            "data_synced": False
+            }
+
+
+def f1_fetch_api_node(state: F1SubState) -> dict:
+    """
+    NODE 3: Fetch data from FastF1 API and sync to Neon.
+    This node is only reached if the agent decides data is missing.
+    Includes safeguards against infinite loops.
+    """
+    print("--- NODE 3: Fetch API & Sync to Database ---")
+
     entities = state.get("entities", {})
     year = entities.get("year")
-    location = entities.get("event_name") or entities.get("location")
-    # EARLY EXIT: If Node 1 already asked for clarification, skip this node entirely
-    if state.get("final_response"):
-        print(">>> [SKIP] Missing context. Bypassing sync.")
+    location = entities.get("event_name")
+    fetch_attempts = state.get("fetch_attempts", 0)
+
+    MAX_FETCH_ATTEMPTS = 2  # Prevent infinite loops
+
+    if fetch_attempts >= MAX_FETCH_ATTEMPTS:
+        msg = f"⚠️ Max fetch attempts ({MAX_FETCH_ATTEMPTS}) reached. Cannot retrieve data."
+        logger.warning(msg)
+        return {
+            "final_response": msg,
+            "data_synced": False,
+            "fetch_attempts": fetch_attempts
+        }
+
+    if not year or not location:
+        msg = "Cannot fetch: year and location are required. Please specify the race (e.g., '2024 Monaco')."
+        return {
+            "final_response": msg,
+            "data_synced": False,
+            "fetch_attempts": fetch_attempts
+        }
+
+    try:
+        sync_result = sync_telemetry_to_neon(year, location, "R")
+        logger.info(f"Sync result: {sync_result}")
+
+        return {
+            "db_query_result": "",  # Clear for next cycle
+            "data_synced": True,
+            "fetch_attempts": fetch_attempts + 1
+        }
+    except Exception as e:
+        error_msg = f"Failed to fetch from API: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "final_response": error_msg,
+            "data_synced": False,
+            "fetch_attempts": fetch_attempts + 1
+        }
+
+
+def f1_decision_node(state: F1SubState) -> dict:
+    """
+    DECISION NODE: Routes the flow based on the database query result.
+
+    Returns:
+    - "query": Loop back to query_db_node (data was just synced)
+    - "fetch": Go to fetch_api_node (data is missing from DB)
+    - "end": Done, go to END
+    """
+    print("--- DECISION NODE: Route Based on Query Result ---")
+
+    db_result = state.get("db_query_result", "").lower()
+    data_synced = state.get("data_synced", False)
+    fetch_attempts = state.get("fetch_attempts", 0)
+
+    # If we just synced data, loop back to query
+    if data_synced:
+        print(">>> 🔄 Data synced! Looping back to query database.")
         return {}
-        
-    if year and location:
-        if not check_if_data_exists(year, location):
-            print(f">>> [CACHE MISS] Fetching {year} {location} from API...")
-            try:
-                sync_telemetry_to_neon(year, location, 'R')
-            except Exception as e:
-                print(f">>> [SYNC ERROR] {e}")
+
+    # If DB returned empty, decide whether to fetch
+    if "no_data_in_db" in db_result or "no results" in db_result or len(db_result.strip()) == 0:
+        if fetch_attempts < 2:
+            print(">>> 🔗 No data in DB. Fetching from API...")
+            return {}
         else:
-            print(f">>> [CACHE HIT] {year} {location} data is ready.")
-    else:
-        # Don't return a final_response here, just let it pass to SQL
-        print(">>> [INFO] No race context for sync. Proceeding to SQL Agent.")
-            
+            print(">>> ⚠️ Max attempts reached. Exiting with empty result.")
+            return {}
+
+    # DB has data - we're done
+    print(">>> ✅ Found data in database. Finalizing response.")
     return {}
 
 
-def f1_sql_node(state: F1SubState):
-    """Node 3: Executes the dynamic SQL Query."""
-    print("--- NODE 3: Text-to-SQL ---")
-    entities = state.get("entities", {})
-    # EARLY EXIT: If Node 1 already asked for clarification, do not run the SQL Agent
-    if state.get("final_response"):
-        print(">>> [SKIP] Missing context. Bypassing Text-to-SQL.")
-        return {}
-        
-    year = entities.get("year")
-    location = entities.get("location")
+def f1_finalize_node(state: F1SubState) -> dict:
+    """
+    NODE 4: Finalize the response. Only reached when we have valid data or exhausted attempts.
+    """
+    print("--- NODE 4: Finalize Response ---")
 
-    print(">>> Executing dynamic Text-to-SQL...")
-    context = json.dumps(entities)
-    agent_prompt = (
-        f"Query: {state['query']}\n"
-        f"Context Entities: {context}\n"
-        f"Instructions:\n"
-        f"1. Use the 'f1_telemetry' table for lap-by-lap data.\n"
-        f"2. Use the provided Context Entities to filter your SQL queries (e.g., year, event_name).\n"
-        f"3. If the telemetry table doesn't have the answer, use your general knowledge."
-    )
-    
-    result = f1_sql_executor.invoke({"input": agent_prompt})
-    return {"final_response": result["output"]}
-    
-    # agent_prompt = (
-    #     f"You are a TWG Global F1 Analyst. Query: '{state['query']}'\n\n"
-    #     f"DATA INTEGRITY RULES:\n"
-    #     f"1. Table: 'f1_telemetry' | Filters: WHERE year = {year} AND event_name = '{location}'\n"
-    #     f"2. DO NOT GUESS NAMES.\n"
-    #     f"3. Cross-reference the 'driver' code with the 'team' column before naming a driver.\n"
-    #     f"4. If you are unsure of a name, just use the Driver Code (e.g., 'Driver NOR') or the Driver Number."
-    # )
-    
-    # result = f1_sql_executor.invoke({"input": agent_prompt})
-    
-    # return {"final_response": result["output"]}
+    db_result = state.get("db_query_result", "")
+    final_response = state.get("final_response", "")
+
+    # If we hit an error during fetch, use that
+    if final_response:
+        return {"final_response": final_response}
+
+    # Otherwise, use the database result
+    if not db_result or "no_data_in_db" in db_result.lower():
+        return {
+            "final_response": "I couldn't find the requested F1 data in the database. Please check the year and race location."
+        }
+
+    return {"final_response": db_result}
 
 
-
+# === GRAPH ASSEMBLY ===
 
 f1_internal_builder = StateGraph(F1SubState)
+
+# Add nodes
 f1_internal_builder.add_node("extract", f1_extract_node)
-f1_internal_builder.add_node("sync", f1_sync_node)
-f1_internal_builder.add_node("sql", f1_sql_node)
+f1_internal_builder.add_node("query", f1_query_db_node)
+f1_internal_builder.add_node("fetch", f1_fetch_api_node)
+f1_internal_builder.add_node("decide", f1_decision_node)
+f1_internal_builder.add_node("finalize", f1_finalize_node)
 
+# Start with extraction
 f1_internal_builder.add_edge(START, "extract")
-f1_internal_builder.add_edge("extract", "sync")
-f1_internal_builder.add_edge("sync", "sql")
-f1_internal_builder.add_edge("sql", END)
 
+# Extract → Query (first database attempt)
+f1_internal_builder.add_edge("extract", "query")
 
+# Query → Decision (decide what to do next)
+f1_internal_builder.add_edge("query", "decide")
+
+# Decision logic: conditional edges that create the cycle
+f1_internal_builder.add_conditional_edges(
+    "decide",
+    lambda state: (
+        "end" if state.get("final_response") else
+        "query" if state.get("data_synced") else
+        "fetch" if "no_data_in_db" in state.get("db_query_result", "").lower() and state.get("fetch_attempts", 0) < 2 else
+        "end"
+    ),
+    {
+        "query": "query",   # Loop back to query
+        "fetch": "fetch",   # Go to fetch/sync
+        "end": "finalize"   # Done, finalize response
+    }
+)
+
+# Fetch → Decision (after syncing, decide again)
+f1_internal_builder.add_edge("fetch", "decide")
+
+# Finalize → END
+f1_internal_builder.add_edge("finalize", END)
+
+# Compile the subgraph
 f1_sector_graph = f1_internal_builder.compile()
 
 if __name__ == "__main__":
     with open("f1_internal_architecture.png", "wb") as f:
         f.write(f1_sector_graph.get_graph().draw_mermaid_png())
     print("✅ Generated f1_internal_architecture.png")
-# def f1_node(state: AgentState):
-#     """
-#     Production F1 Node. Stateless sync to Cloud Neon.
-#     """
-#     print("--- LOG: Processing F1 Sector ---")
-    
-#     extraction_prompt = f"""
-#     Analyze this query: "{state['query']}"
-#     Extract the 'year' (as an integer) and the 'location' (as a string).
-#     If either is missing, return null for that field.
-    
-#     You MUST respond with ONLY a valid JSON object. No markdown, no explanations.
-#     Example 1: {{"year": 2024, "location": "Monaco"}}
-#     Example 2: {{"year": null, "location": "Silverstone"}}
-#     Example 3: {{"year": null, "location": null}}
-#     """
-#     extraction = llm.invoke([HumanMessage(content=extraction_prompt)]).content
-
-#     try:
-#         extracted_data = json.loads(extraction)
-#         year = extracted_data.get("year")
-#         location = extracted_data.get("location")
-
-#         if not year or not location:
-#             print(">>> [MISSING DATA] Prompting user for clarification...")
-#             missing_items = []
-#             if not year: missing_items.append("the year")
-#             if not location: missing_items.append("the specific race/location")
-            
-#             clarification_msg = f"Could you please specify {' and '.join(missing_items)}? (For example: '2024 Monaco')"
-            
-#             return {
-#                 "final_response": clarification_msg,
-#                 "domain_detected": "f1"
-#             }
-
-
-#         # 1. CACHE CHECK & SYNC (Data Orchestration)
-#         if not check_if_data_exists(year, location):
-#             print(f">>> [CACHE MISS] Fetching {year} {location} from API...")
-#             # We no longer need to save the return value of sync_telemetry_to_neon
-#             # because the SQL agent will fetch the data directly from the DB.
-#             sync_telemetry_to_neon(year, location, 'R')
-#         else:
-#             print(f">>> [CACHE HIT] {year} {location} found in Neon DB.")
-
-#         # 2. DYNAMIC TEXT-TO-SQL (Query Orchestration)
-#         print(">>> Executing dynamic Text-to-SQL via LangChain Agent...")
-        
-#         # We wrap the user's query with strict instructions so the agent 
-#         # filters the database efficiently and responds as an analyst.
-#         agent_prompt = (
-#             f"You are a TWG Global F1 Analyst. Answer the user's query: '{state['query']}'\n\n"
-#             f"CRITICAL DB INSTRUCTIONS:\n"
-#             f"1. The data for this specific race is in the 'f1_telemetry' table.\n"
-#             f"2. You MUST include WHERE year = {year} AND event_name = '{location}' in every SQL query you write.\n"
-#             f"3. Do not query other years or locations.\n"
-#             f"4. Once you have the SQL result, provide a professional, concise summary."
-#         )
-        
-#         # Invoke the LangChain SQL Agent
-#         result = f1_sql_executor.invoke({"input": agent_prompt})
-        
-#         return {
-#             "final_response": result["output"],
-#             "messages": [HumanMessage(content=f"Processed dynamic Text-to-SQL for {year} {location}")],
-#             "domain_detected": "f1"
-#         }
-
-#     except Exception as e:
-#         return {"final_response": f"F1 Cloud Sync Error: {str(e)}"}

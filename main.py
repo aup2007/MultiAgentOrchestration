@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, END, START
 from state import AgentState
 from f1_agent import f1_sector_graph
+from baseball_agent import baseball_sector_graph
 # from soccer_agent import soccer_node
 # from baseball_agent import baseball_node
 from langchain_core.messages import HumanMessage
@@ -103,7 +104,7 @@ builder = StateGraph(AgentState)
 # Register sector nodes
 builder.add_node("f1_sector", f1_sector_graph)
 # builder.add_node("soccer_sector", soccer_sector_graph)  # Uncomment when available
-# builder.add_node("baseball_sector", baseball_sector_graph)  # Uncomment when available
+builder.add_node("baseball_sector", baseball_sector_graph)  # Uncomment when available
 
 # Conditional routing from START: supervisor_router decides which sector to route to
 builder.add_conditional_edges(
@@ -112,14 +113,14 @@ builder.add_conditional_edges(
     {
         "f1_sector": "f1_sector",
         "soccer_sector": "f1_sector",  # TODO: Replace with soccer_sector when ready
-        "baseball_sector": "f1_sector",  # TODO: Replace with baseball_sector when ready
+        "baseball_sector": "baseball_sector",  # TODO: Replace with baseball_sector when ready
     }
 )
 
 # After sector processing, route to END
 builder.add_edge("f1_sector", END)
 # builder.add_edge("soccer_sector", END)  # Uncomment when available
-# builder.add_edge("baseball_sector", END)  # Uncomment when available
+builder.add_edge("baseball_sector", END)  # Uncomment when available
 # --- 4. COMPILE & EXECUTE ---
 graph = builder.compile()
 try:
@@ -151,4 +152,4 @@ def run_sports_ai(user_query: str):
                 print(f"RESULT: {state_update['final_response']}")
 
 if __name__ == "__main__":
-    run_sports_ai("Which team was lewis hamilton part of in 2022?")
+    run_sports_ai("What is the Dodgers record right now?")

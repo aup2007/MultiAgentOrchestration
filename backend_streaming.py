@@ -27,7 +27,7 @@ from langchain_core.messages import HumanMessage, AIMessageChunk
 from langgraph.graph import StateGraph, END, START
 from state import AgentState
 from f1_agent import f1_sector_graph
-from main import supervisor_router  # Import the LLM router
+from main import graph  # Import the LLM router
 import logging
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import Depends, status
@@ -43,6 +43,16 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="TWG Sports Intelligence Platform - Streaming")
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], # Change this to localhost:3000 in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================================
 # REQUEST/RESPONSE MODELS
@@ -155,6 +165,7 @@ async def stream_chat_agentic(
         SSE-formatted event strings
     """
     logger.info(f"Starting stream for query: {query[:50]}...")
+    config = {"configurable": {"thread_id": f"session_{user_role}"}}
 
     # Initialize graph state
     initial_state = {
@@ -170,12 +181,10 @@ async def stream_chat_agentic(
         active_node = None
         final_text_sent = False
 
-        # Main graph with router → sector subgraph
-        main_graph = build_main_graph()
-
         # Stream with dual modes: updates (node trace) + messages (tokens)
-        async for event in main_graph.astream(
+        async for event in graph.astream(
             initial_state,
+            config,
             stream_mode=["updates", "messages"]
         ):
 
@@ -219,12 +228,20 @@ async def stream_chat_agentic(
                         await asyncio.sleep(0.001)
 
         # Signal completion
-        logger.info("Stream completed successfully")
-        yield emit_message("", is_final=True)
+        current_state = graph.get_state(config)
+        if current_state.next:
+            logger.info("Graph paused for Human-in-the-Loop.")
+            yield format_sse_event(
+                event_type="interrupt",
+                data={"message": "Waiting for API approval"}
+            )
+        else:
+            logger.info("Stream completed successfully")
+            yield emit_message("", is_final=True)
 
         # Final node completion status
-        if active_node:
-            yield emit_update(active_node, status="completed")
+            if active_node:
+                yield emit_update(active_node, status="completed")
 
     except Exception as e:
         logger.error(f"Stream error: {str(e)}")
@@ -358,26 +375,59 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     )
 
 
-@app.post("/chat/stream/sector/{sector}")
-async def chat_stream_sector(
-    sector: str,
-    request: ChatRequest
-) -> StreamingResponse:
-    """
-    Stream chat response for a specific sector subgraph.
 
-    Args:
-        sector: "f1_sector", "baseball_sector", "football_sector"
-        request: Chat request with query
-    """
-    return StreamingResponse(
-        stream_sector_subgraph(sector, request.query, request.user_role),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-    )
+@app.post("/chat/resume")
+async def chat_resume(request: Request) -> dict:
+    """Resumes the paused graph from memory when the user clicks Approve."""
+    # Note: In production, extract user_role dynamically from headers
+    config = {"configurable": {"thread_id": "session_user"}}
+    
+    try:
+        # Pass None to resume from the breakpoint
+        for event in graph.stream(None, config):
+            pass 
+            
+        final_state = graph.get_state(config)
+        values = final_state.values
+        
+        # Safely extract the final response based on which sector handled it
+        if "football_sector" in values:
+            answer = values["football_sector"].get("final_response")
+        elif "f1_sector" in values:
+            answer = values["f1_sector"].get("final_response")
+        elif "baseball_sector" in values:
+            answer = values["baseball_sector"].get("final_response")
+        else:
+            answer = values.get("final_response", "Process complete.")
+            
+        return {"status": "success", "final_response": answer}
+        
+    except Exception as e:
+        logger.error(f"Resume error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# @app.post("/chat/stream/sector/{sector}")
+# async def chat_stream_sector(
+#     sector: str,
+#     request: ChatRequest
+# ) -> StreamingResponse:
+#     """
+#     Stream chat response for a specific sector subgraph.
+
+#     Args:
+#         sector: "f1_sector", "baseball_sector", "football_sector"
+#         request: Chat request with query
+#     """
+#     return StreamingResponse(
+#         stream_sector_subgraph(sector, request.query, request.user_role),
+#         media_type="text/event-stream",
+#         headers={
+#             "Cache-Control": "no-cache",
+#             "X-Accel-Buffering": "no",
+#         }
+#     )
 
 
 @app.post("/chat")
@@ -389,6 +439,7 @@ async def chat_non_streaming(request: ChatRequest) -> dict:
     Less real-time UX, but simpler for basic consumption.
     """
     logger.info(f"Non-streaming chat: {request.query[:50]}...")
+    config = {"configurable": {"thread_id": f"session_{request.user_role}"}}
 
     initial_state = {
         "messages": [HumanMessage(content=request.query)],
@@ -399,8 +450,7 @@ async def chat_non_streaming(request: ChatRequest) -> dict:
     }
 
     try:
-        main_graph = build_main_graph()
-        final_state = main_graph.invoke(initial_state)
+        final_state = graph.invoke(initial_state, config)
 
         return {
             "status": "success",
@@ -427,46 +477,46 @@ async def health_check() -> dict:
 # GRAPH BUILDER
 # ============================================================================
 
-def build_main_graph() -> StateGraph:
-    """
-    Build the main LangGraph with supervisor router.
+# def build_main_graph() -> StateGraph:
+#     """
+#     Build the main LangGraph with supervisor router.
 
-    Reconstructed here to avoid circular imports.
+#     Reconstructed here to avoid circular imports.
 
-    Returns:
-        Compiled LangGraph
-    """
-    from main import (
-        supervisor_router,
-        DEFAULT_SECTOR,
-        VALID_SECTORS
-    )
+#     Returns:
+#         Compiled LangGraph
+#     """
+#     from main import (
+#         supervisor_router,
+#         DEFAULT_SECTOR,
+#         VALID_SECTORS
+#     )
 
-    builder = StateGraph(AgentState)
+#     builder = StateGraph(AgentState)
 
-    # Add nodes
-    builder.add_node("f1_sector", f1_sector_graph)
-    # builder.add_node("baseball_sector", baseball_sector_graph)
-    # builder.add_node("football_sector", football_sector_graph)
+#     # Add nodes
+#     builder.add_node("f1_sector", f1_sector_graph)
+#     # builder.add_node("baseball_sector", baseball_sector_graph)
+#     # builder.add_node("football_sector", football_sector_graph)
 
-    # Routing from START
-    builder.add_conditional_edges(
-        START,
-        supervisor_router,
-        {
-            "f1_sector": "f1_sector",
-            # "baseball_sector": "baseball_sector",
-            # "football_sector": "football_sector",
-            END: END
-        }
-    )
+#     # Routing from START
+#     builder.add_conditional_edges(
+#         START,
+#         supervisor_router,
+#         {
+#             "f1_sector": "f1_sector",
+#             # "baseball_sector": "baseball_sector",
+#             # "football_sector": "football_sector",
+#             END: END
+#         }
+#     )
 
-    # Edges from sectors to END
-    builder.add_edge("f1_sector", END)
-    # builder.add_edge("baseball_sector", END)
-    # builder.add_edge("football_sector", END)
+#     # Edges from sectors to END
+#     builder.add_edge("f1_sector", END)
+#     # builder.add_edge("baseball_sector", END)
+#     # builder.add_edge("football_sector", END)
 
-    return builder.compile()
+#     return builder.compile()
 
 
 # ============================================================================

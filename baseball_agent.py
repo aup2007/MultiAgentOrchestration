@@ -367,18 +367,68 @@ def baseball_fetch_api_node(state: BaseballSubState) -> dict:
         return {"final_response": str(e), "data_synced": False, "fetch_attempts": fetch_attempts + 1}
 
 def baseball_decision_node(state: BaseballSubState) -> dict:
+    print("--- DECISION NODE: Route Based on Query Result ---")
+
+    db_result = state.get("db_query_result", "").lower()
+    data_synced = state.get("data_synced", False)
+    fetch_attempts = state.get("fetch_attempts", 0)
+
+    # 1. If we just synced data from an API, loop back to the Query Node
+    if data_synced:
+        print(">>> 🔄 Data synced! Looping back to query database.")
+        return {} # State contains data_synced=True, conditional_edge handles routing
+
+    # 2. If the DB is empty, decide if we should try fetching from a Baseball API
+    if "no_data_in_db" in db_result or not db_result.strip():
+        if fetch_attempts < 2:
+            print(">>> 🔗 No Dodgers data found. Triggering API Fetch...")
+            return {}
+        else:
+            print(">>> ⚠️ Max fetch attempts reached.")
+            return {}
+
+    print(">>> ✅ Data verified. Moving to Finalize.")
     return {}
 
 def baseball_finalize_node(state: BaseballSubState) -> dict:
     print("--- NODE 4: Finalize Response ---")
+    
     db_result = state.get("db_query_result", "")
     final_response = state.get("final_response", "")
+    user_query = state.get("query", "")
 
-    if final_response: return {"final_response": final_response}
+    # 1. If an error message was already generated, pass it through
+    if final_response: 
+        return {"final_response": final_response}
+    
+    # 2. Handle empty results
     if not db_result or "no_data_in_db" in db_result.lower():
-        return {"final_response": "I couldn't find the requested Dodgers data."}
+        return {"final_response": "I couldn't find the requested Dodgers data in the database."}
 
-    return {"final_response": db_result}
+    # 3. SYNTHESIS: Convert SQL jargon into Natural Language
+    
+    synthesis_prompt = f"""
+    You are a professional LA Dodgers analyst and commentator.
+    
+    User Question: {user_query}
+    Raw Database Data: {db_result}
+    
+    Based ONLY on the 'Raw Database Data', provide a conversational and concise answer.
+    
+    STRICT RULES:
+    - NEVER mention table names (e.g., 'dodgers_statcast'), SQL, or columns.
+    - NEVER say 'The query returned' or 'Based on the data provided'.
+    - If the data is a list of players/stats, present them naturally.
+    - Keep the tone professional but fan-friendly.
+    """
+    
+    try:
+        # Use your initialized LLM to clean up the output
+        clean_response = llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        return {"final_response": clean_response}
+    except Exception as e:
+        # Fallback to raw result if the LLM fails so the user gets *something*
+        return {"final_response": db_result}
 
 # === GRAPH ASSEMBLY ===
 baseball_internal_builder = StateGraph(BaseballSubState)

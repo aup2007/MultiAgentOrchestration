@@ -465,8 +465,6 @@ def f1_finalize_node(state: F1SubState) -> dict:
         }
 
     # SYNTHESIS STEP: Convert the raw SQL agent output into a conversational answer
-    from langchain_core.messages import HumanMessage
-    
     synthesis_prompt = f"""
     You are an expert F1 commentator.
     

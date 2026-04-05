@@ -446,24 +446,49 @@ def f1_decision_node(state: F1SubState) -> dict:
 
 def f1_finalize_node(state: F1SubState) -> dict:
     """
-    NODE 4: Finalize the response. Only reached when we have valid data or exhausted attempts.
+    NODE 4: Finalize the response. Synthesizes the SQL Agent's output into Natural Language.
     """
     print("--- NODE 4: Finalize Response ---")
 
     db_result = state.get("db_query_result", "")
     final_response = state.get("final_response", "")
+    user_query = state.get("query", "")
 
     # If we hit an error during fetch, use that
     if final_response:
         return {"final_response": final_response}
 
-    # Otherwise, use the database result
+    # If the database returned empty
     if not db_result or "no_data_in_db" in db_result.lower():
         return {
             "final_response": "I couldn't find the requested F1 data in the database. Please check the year and race location."
         }
 
-    return {"final_response": db_result}
+    # SYNTHESIS STEP: Convert the raw SQL agent output into a conversational answer
+    from langchain_core.messages import HumanMessage
+    
+    synthesis_prompt = f"""
+    You are an expert F1 commentator.
+    
+    User Question: {user_query}
+    Raw Database Output: {db_result}
+    
+    Synthesize the 'Raw Database Output' into a concise, conversational answer for the fan.
+    
+    CRITICAL RULES:
+    1. Answer the question directly using ONLY the provided data.
+    2. NEVER mention databases, tables, SQL queries, columns, or rows.
+    3. NEVER say "The query returned", "Based on the data", or "The strategy is as follows:".
+    """
+    
+    try:
+        # Uses the GPT-OSS-120b llm already defined at the top of your file
+        clean_response = llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        return {"final_response": clean_response}
+    except Exception as e:
+        logger.error(f"Synthesis failed: {e}")
+        # Fallback to the raw result if the LLM call fails
+        return {"final_response": db_result}
 
 
 # === GRAPH ASSEMBLY ===

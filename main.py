@@ -2,9 +2,9 @@ from langgraph.graph import StateGraph, END, START
 from state import AgentState
 from f1_agent import f1_sector_graph
 from baseball_agent import baseball_sector_graph
-# from soccer_agent import soccer_node
-# from baseball_agent import baseball_node
-from langchain_core.messages import HumanMessage
+from football_agent import football_sector_graph
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_groq import ChatGroq
 import json
 import logging
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0,max_tokens=20)
 
 # Define valid sectors
-VALID_SECTORS = ["f1_sector", "soccer_sector", "baseball_sector"]
+VALID_SECTORS = ["f1_sector", "football_sector", "baseball_sector"]
 DEFAULT_SECTOR = "f1_sector"  # Fallback sector
 
 
@@ -58,7 +58,7 @@ def safe_route_invoke(prompt_content: str):
     return router_llm.invoke([HumanMessage(content=prompt_content)]).content
 
 # --- 1. THE ROUTER (The Decision Maker) ---
-def supervisor_router(state: AgentState) -> str:
+def supervisor_router(state: AgentState) -> dict:
     """
     LLM-powered intent classifier that routes queries to the correct sector.
     Uses structured output parsing with fallback error handling.
@@ -68,7 +68,7 @@ Your job is to route incoming user queries to the most appropriate sports sector
 
 AVAILABLE SECTORS:
 - f1_sector: Formula 1, F1, drivers, teams, telemetry, races, lap times, pit stops, qualifying
-- soccer_sector: Soccer, football, goals, transfers, leagues, clubs, strikers, defenders, tactical
+- football_sector: Soccer, football, goals, transfers, leagues, clubs, strikers, defenders, tactical
 - baseball_sector: Baseball, MLB, home runs, innings, pitchers, teams, World Series
 
 ROUTING RULES:
@@ -92,37 +92,47 @@ Output format: plain text sector name or JSON: {"sector": "sector_name"}"""
         sector = parse_router_response(response)
         logger.info(f"Query: '{user_query}' → Routed to: {sector}")
         print(f">>> ROUTING TO: {sector}")
-        return sector
+        return {
+            "domain_detected": sector,
+            "messages": state.get("messages", []) + [
+                AIMessage(content=f" Routed to {sector}")
+            ]
+        }
 
     except Exception as e:
         logger.error(f"Router LLM call failed: {e}. Using default sector: {DEFAULT_SECTOR}")
-        return DEFAULT_SECTOR
+        return {"domain_detected": DEFAULT_SECTOR}
 
 # --- 2. THE GRAPH ASSEMBLY ---
 builder = StateGraph(AgentState)
 
+builder.add_node("supervisor_router", supervisor_router)
 # Register sector nodes
 builder.add_node("f1_sector", f1_sector_graph)
-# builder.add_node("soccer_sector", soccer_sector_graph)  # Uncomment when available
+builder.add_node("football_sector", football_sector_graph)  # Uncomment when available
 builder.add_node("baseball_sector", baseball_sector_graph)  # Uncomment when available
+
+builder.add_edge(START, "supervisor_router")
+
 
 # Conditional routing from START: supervisor_router decides which sector to route to
 builder.add_conditional_edges(
-    START,
-    supervisor_router,
+    "supervisor_router",
+    lambda state: state["domain_detected"],
     {
         "f1_sector": "f1_sector",
-        "soccer_sector": "f1_sector",  # TODO: Replace with soccer_sector when ready
-        "baseball_sector": "baseball_sector",  # TODO: Replace with baseball_sector when ready
+        "football_sector": "football_sector", 
+        "baseball_sector": "baseball_sector", 
     }
 )
 
 # After sector processing, route to END
 builder.add_edge("f1_sector", END)
-# builder.add_edge("soccer_sector", END)  # Uncomment when available
+builder.add_edge("football_sector", END)  # Uncomment when available
 builder.add_edge("baseball_sector", END)  # Uncomment when available
 # --- 4. COMPILE & EXECUTE ---
-graph = builder.compile()
+memory = MemorySaver()
+graph = builder.compile(checkpointer= memory)
 try:
     # Get the visual representation of the graph as PNG bytes
     image_bytes = graph.get_graph(xray=True).draw_mermaid_png()
@@ -152,4 +162,52 @@ def run_sports_ai(user_query: str):
                 print(f"RESULT: {state_update['final_response']}")
 
 if __name__ == "__main__":
-    run_sports_ai("What is the Dodgers record right now?")
+    # run_sports_ai("Where does Chelsea currently sit in the Premier League table?")
+
+
+    config = {"configurable": {"thread_id": "cli_test_1"}}
+    
+    query = "Where does Chelsea currently sit in the Premier League table?"
+    initial_state = {"query": query}
+    
+    print(f"\n>>> QUERY: {query}")
+    
+    # 2. Run the graph until it finishes OR hits a breakpoint
+    for event in graph.stream(initial_state, config):
+        pass # The nodes have their own print statements
+    
+    MAX_RETRIES = 2
+    retry_count = 0
+
+    while retry_count <= MAX_RETRIES:
+    # 3. Check the graph's current state to see if it is paused
+        current_state = graph.get_state(config)
+    
+    
+    # .next contains the name of the node it is waiting to execute. 
+    # If it's not empty, it means we hit our breakpoint!
+        if not current_state.next:
+            print("\n==================================================")
+            print("✅ FINAL RESULT:")
+            result = current_state.values.get('football_sector', {}).get('final_response', "No response generated.")
+            print(result)
+            print("==================================================")
+            break
+            
+        print(f"\n🚨 GRAPH PAUSED (Attempt {retry_count + 1} of {MAX_RETRIES + 1}) 🚨")
+        print("The agent is preparing to execute an API call.")
+        
+        user_input = input("Do you approve the execution? (y/n): ")
+        
+        if user_input.lower() == 'y':
+            print("\n▶️ RESUMING GRAPH...")
+            retry_count += 1
+            # Resume from the pause
+            for event in graph.stream(None, config):
+                pass
+        else:
+            print("\n❌ Execution cancelled by human.")
+            break
+            
+    if retry_count > MAX_RETRIES:
+        print("\n⚠️ SYSTEM HALTED: Maximum retries reached. The AI cannot resolve the issue.")

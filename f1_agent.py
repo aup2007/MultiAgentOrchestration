@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class F1SubState(TypedDict):
     query: str
     entities: dict[str, Any]
+    schema_grounding: dict[str, Any]
     final_response: str
     db_query_result: str  # Result from Text-to-SQL
     fetch_attempts: int  # Track number of API fetch attempts
@@ -46,7 +47,7 @@ f1_sql_executor = create_sql_agent(
     llm=sql_llm,
     db=f1_db,
     agent_type="openai-tools",
-    verbose=True
+    verbose=False
 )
 
 
@@ -66,6 +67,18 @@ def safe_extract_invoke(prompt_content: str):
 )
 def safe_sql_invoke(prompt_dict: dict):
     return f1_sql_executor.invoke(prompt_dict)
+
+
+def parse_json_safely(text: str) -> dict:
+    """Helper to strip markdown backticks from LLM JSON output."""
+    try:
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
+    except Exception as e:
+        logger.error(f"JSON Parse Error: {e} - Raw: {text}")
+        return {"question_type": "unknown", "relevant_tables": [], "relevant_columns": [], "strategy": "fallback", "needs_validation": True, "reason": "Failed to parse grounding."}
+
+
 
 
 
@@ -215,6 +228,62 @@ def f1_extract_node(state: F1SubState) -> dict:
     return {"entities": entities, "fetch_attempts": 0, "data_synced": False}
 
 
+def f1_schema_ground_node(state: F1SubState) -> dict:
+    # print("--- NODE 1.5: Schema Grounding & Strategy Planning ---")
+    print("NODE 1.5", "Schema Grounding & Strategy Planning", "magenta")
+    query_text = state.get("query", "")
+    
+    # Read the DDL explicitly for grounding
+    try:
+        with open("db_utils.py", "r") as f:
+            schema_text = f.read()
+    except Exception as e:
+        schema_text = "Schema unavailable."
+
+    grounding_prompt = f"""
+You are a TWG Global F1 Data Architect.
+Your job is to analyze the user query against the physical database schema and formulate a pure data strategy. 
+Do NOT answer the question. Only map the question to the schema.
+
+User Query: "{query_text}"
+
+Available Database Schema:
+{schema_text}
+
+Analyze the schema and output a query strategy in this EXACT JSON format:
+{{
+  "domain": "f1",
+  "question_type": "direct_lookup|aggregate|comparison|trend|event_level_detail",
+  "relevant_tables": ["list_of_string_table_names"],
+  "relevant_columns": ["list_of_string_column_names"],
+  "strategy": "A concise explanation of how to query this data",
+  "needs_validation": true/false,
+  "reason": "Briefly explain why validation is or isn't needed based on the schema"
+}}
+
+Rules for `needs_validation`:
+Set to `true` IF:
+- The query requires counting, summing, or aggregating records.
+- The question relies on interpreting an ambiguous column (e.g., win/loss indicators).
+- The query requires deriving a value not explicitly stored.
+Otherwise, set to `false`.
+
+Respond with ONLY the valid JSON object.
+"""
+    
+    # Using the heavy reasoning model to ensure flawless planning
+    response_text = sql_llm.invoke([HumanMessage(content=grounding_prompt)]).content
+    schema_grounding = parse_json_safely(response_text)
+    
+    print(f">>> Grounding Strategy: {schema_grounding.get('strategy', 'Failed to plan')}")
+    print(f">>> Needs Validation: {schema_grounding.get('needs_validation', True)}")
+
+    return {"schema_grounding": schema_grounding}
+
+
+
+
+
 def f1_query_db_node(state: F1SubState) -> dict:
     """
     NODE 2: Query the database using Text-to-SQL.
@@ -225,6 +294,7 @@ def f1_query_db_node(state: F1SubState) -> dict:
 
     entities = state.get("entities", {})
     query_text = state.get("query", "")
+    schema_grounding = state.get("schema_grounding", {})
     year = entities.get("year")
     event_name = entities.get("event_name")
     driver = entities.get("driver")
@@ -257,18 +327,23 @@ def f1_query_db_node(state: F1SubState) -> dict:
             logger.error(f"Existence check failed: {e}")
 
     # Build context for the SQL agent
+    needs_val_rule = "You MUST validate your interpretation by running a small sample query (e.g., SELECT * LIMIT 3) FIRST to observe the raw row format." if schema_grounding.get("needs_validation") else "Validation query is optional for this direct lookup."
     context = json.dumps(entities)
-    agent_prompt = (
-        f"You are a TWG Global F1 Analyst. Answer this query: '{query_text}'\n\n"
-        f"Context Entities: {context}\n\n"
-        f"INSTRUCTIONS:\n"
-        f"1. In f1_telemetry,the driver column stores 3-letter driver codes (e.g. HAM, VER, LEC), not full driver names.\n"
-        f"2. Query the 'f1_telemetry' table for lap-by-lap data.\n"
-        f"3. Use the provided entities to filter (e.g., WHERE year = {entities.get('year')} AND event_name = '{entities.get('event_name')}').\n"
-        f"4. If the table returns NO results or is empty, report 'NO_DATA_IN_DB'.\n"
-        f"5. If the table HAS data, provide a professional summary.\n"
-        f"6. If you can't find the answer in the database, say so clearly."
-    )
+    agent_prompt = f"""
+        You are a TWG Global F1 Analyst. Answer this query: '{query_text}'
+
+        Context Entities: {json.dumps(entities)}
+
+        Query Strategy Plan (Follow this strictly):
+        {json.dumps(schema_grounding, indent=2)}
+
+        INSTRUCTIONS:
+        1. Focus exclusively on the `relevant_tables` and `relevant_columns` outlined in your strategy plan.
+        2. {needs_val_rule}
+        3. Never invent tables or columns.
+        4. If the table returns NO results or is empty, report exactly 'NO_DATA_IN_DB'.
+        5. In the final answer, cite the supporting table(s), column(s), and the basis of your result.
+        """
 
     try:
         # result = f1_sql_executor.invoke({"input": agent_prompt})
@@ -397,6 +472,7 @@ f1_internal_builder = StateGraph(F1SubState)
 
 # Add nodes
 f1_internal_builder.add_node("extract", f1_extract_node)
+f1_internal_builder.add_node("schema_ground", f1_schema_ground_node)
 f1_internal_builder.add_node("query", f1_query_db_node)
 f1_internal_builder.add_node("fetch", f1_fetch_api_node)
 f1_internal_builder.add_node("decide", f1_decision_node)
@@ -404,9 +480,10 @@ f1_internal_builder.add_node("finalize", f1_finalize_node)
 
 # Start with extraction
 f1_internal_builder.add_edge(START, "extract")
+f1_internal_builder.add_edge("extract", "schema_ground")
 
 # Extract → Query (first database attempt)
-f1_internal_builder.add_edge("extract", "query")
+f1_internal_builder.add_edge("schema_ground", "query")
 
 # Query → Decision (decide what to do next)
 f1_internal_builder.add_edge("query", "decide")

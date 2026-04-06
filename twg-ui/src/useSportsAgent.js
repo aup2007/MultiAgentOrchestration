@@ -7,6 +7,7 @@ export function useSportsAgent() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [hitlState, setHitlState] = useState({ isWaiting: false, data: null });
   const [error, setError] = useState('');
+  const threadId = useMemo(() => crypto.randomUUID(), []);
 
   const activeTrace = useMemo(() => {
     return traceOrder.map((node) => traceMap[node]).filter(Boolean);
@@ -73,7 +74,7 @@ export function useSportsAgent() {
       const response = await fetch('http://localhost:8000/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, user_role: 'admin' }),
+        body: JSON.stringify({ query, user_role: 'admin', thread_id: threadId }),
       });
 
       if (!response.ok || !response.body) {
@@ -175,6 +176,11 @@ export function useSportsAgent() {
     try {
       const res = await fetch('http://localhost:8000/chat/resume', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+        thread_id: threadId,
+        action: approved ? 'approved' : 'rejected',
+  }),
       });
 
       if (!res.ok) {

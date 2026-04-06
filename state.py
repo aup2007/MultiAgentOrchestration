@@ -10,3 +10,6 @@ class AgentState(TypedDict):
     user_role: str  
     domain_detected: str  
     final_response: str
+
+    is_safe: bool
+    guardrail_reason: str

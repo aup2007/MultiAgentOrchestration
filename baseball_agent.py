@@ -177,10 +177,16 @@ def sync_baseball_data_to_neon(year: int, category: str) -> str:
             table_name = "dodgers_statcast"
         elif category == "roster":
             # Fetches active players and their IDs
-            from pybaseball import playerid_lookup
+            # from pybaseball import playerid_lookup
             # We can pull the Dodgers active roster (you could use pybaseball's roster function)
             # For simplicity, pybaseball.roster(year) fetches the team roster
-            df = pybaseball.roster(year, 'LAD')
+            log_node("PyBaseball Sync", f"Fetching roster for {year} LAD", "yellow")
+            df = pybaseball.rosters(year)
+            # Filter to Dodgers only
+            df = df[df['Team'].isin(['LAD', 'Dodgers', 'Los Angeles Dodgers'])]
+            # Keep useful roster columns and drop duplicates
+            keep_cols = ['Name', 'Team', 'Age', 'playerid'] if 'playerid' in df.columns else ['Name', 'Team', 'Age']
+            df = df[keep_cols].drop_duplicates() if not df.empty else df
             table_name = "dodgers_roster"
         else:
             raise ValueError(f"Unknown category: {category}")
@@ -244,7 +250,7 @@ def baseball_schema_ground_node(state: BaseballSubState) -> dict:
     
     # Read the DDL explicitly for grounding
     try:
-        with open("init_baseball_db.py", "r") as f:
+        with open("baseball_db_init.py", "r") as f:
             schema_text = f.read()
     except Exception as e:
         schema_text = "Schema unavailable."
@@ -424,7 +430,7 @@ def baseball_finalize_node(state: BaseballSubState) -> dict:
     
     try:
         # Use your initialized LLM to clean up the output
-        clean_response = llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        clean_response = extract_llm.invoke([HumanMessage(content=synthesis_prompt)]).content
         return {"final_response": clean_response}
     except Exception as e:
         # Fallback to raw result if the LLM fails so the user gets *something*

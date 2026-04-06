@@ -31,6 +31,8 @@ from main import graph  # Import the LLM router
 import logging
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import Depends, status
+from langgraph.types import Command
+from fastapi import HTTPException, Request
 
 
 USERS_DB = {
@@ -62,6 +64,7 @@ class ChatRequest(BaseModel):
     """User chat message."""
     query: str
     user_role: str = "user"
+    thread_id: str
 
 
 class SSEEvent(BaseModel):
@@ -145,7 +148,8 @@ def emit_message(token: str, is_final: bool = False) -> str:
 
 async def stream_chat_agentic(
     query: str,
-    user_role: str = "user"
+    user_role: str = "user",
+    thread_id: str = "session_user",
 ) -> AsyncIterator[str]:
     """
     Stream response from agentic graph with dual-stream output.
@@ -165,7 +169,7 @@ async def stream_chat_agentic(
         SSE-formatted event strings
     """
     logger.info(f"Starting stream for query: {query[:50]}...")
-    config = {"configurable": {"thread_id": f"session_{user_role}"}}
+    config = {"configurable": {"thread_id": thread_id}}
 
     # Initialize graph state
     initial_state = {
@@ -366,7 +370,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     print(event['data']['token'], end='', flush=True)
     """
     return StreamingResponse(
-        stream_chat_agentic(request.query, request.user_role),
+        stream_chat_agentic(request.query, request.user_role, request.thread_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -380,11 +384,17 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 async def chat_resume(request: Request) -> dict:
     """Resumes the paused graph from memory when the user clicks Approve."""
     # Note: In production, extract user_role dynamically from headers
-    config = {"configurable": {"thread_id": "session_user"}}
+    payload = await request.json()
+    
+    # 2. Use the EXACT thread_id that was used in the /chat/stream endpoint
+    # (Falling back to "session_user" just in case you are hardcoding it everywhere)
+    thread_id = payload.get("thread_id", "session_user")
+    config = {"configurable": {"thread_id": thread_id}}
     
     try:
+        resume_value = payload.get("action", "approved")
         # Pass None to resume from the breakpoint
-        for event in graph.stream(None, config):
+        for event in graph.stream(Command(resume=resume_value), config):
             pass 
             
         final_state = graph.get_state(config)
@@ -403,7 +413,7 @@ async def chat_resume(request: Request) -> dict:
         return {"status": "success", "final_response": answer}
         
     except Exception as e:
-        logger.error(f"Resume error: {str(e)}")
+        logger.error(f"Resume checkpoint crash: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

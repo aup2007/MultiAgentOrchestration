@@ -17,6 +17,7 @@ export default function App() {
   const [currentResponse, setCurrentResponse] = useState("");
   const [activeNodes, setActiveNodes] = useState([]);
   const [awaitingApproval, setAwaitingApproval] = useState(false);
+  const [currentThreadId, setCurrentThreadId] = useState(null);
 
   const messagesEndRef = useRef(null);
 
@@ -62,14 +63,19 @@ export default function App() {
     setAwaitingApproval(false);
 
     try {
+
       // POST requests with SSE require the native fetch API and a ReadableStream reader
+      const newThreadId = crypto.randomUUID();
+      setCurrentThreadId(newThreadId);
       const res = await fetch(`${API_URL}/chat/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ query })
+        body: JSON.stringify({ query: query,
+          user_role: "user",
+          thread_id: newThreadId })
       });
 
       if (!res.ok) throw new Error("API Error");
@@ -147,7 +153,11 @@ export default function App() {
     try {
       const res = await fetch(`${API_URL}/chat/resume`, {
         method: "POST",
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({
+          thread_id: currentThreadId,
+          action: "approved"
+        })
       });
       
       if (res.ok) {

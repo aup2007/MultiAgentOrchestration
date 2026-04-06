@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Use a faster, lighter model for routing (lower latency for classification)
 router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0,max_tokens=20)
+safety_checker = ChatGroq(model="meta-llama/llama-prompt-guard-2-22m", temperature=0)
 
 # Define valid sectors
 VALID_SECTORS = ["f1_sector", "football_sector", "baseball_sector"]
@@ -102,9 +103,44 @@ Output format: plain text sector name or JSON: {"sector": "sector_name"}"""
     except Exception as e:
         logger.error(f"Router LLM call failed: {e}. Using default sector: {DEFAULT_SECTOR}")
         return {"domain_detected": DEFAULT_SECTOR}
+    
+
+def global_input_guard_node(state: AgentState) -> dict:
+    print("--- GLOBAL INPUT GUARDRAIL ---")
+    query = state.get("query", "")
+    
+    # Llama Guard expects a specific format, but standard prompting works well via API
+    res = safety_checker.invoke([HumanMessage(content=query)])
+    
+    if "unsafe" in res.content.lower():
+        print(f">>> INPUT BLOCKED by Llama Guard: {res.content}")
+        return {
+            "is_safe": False, 
+            "guardrail_reason": res.content,
+            "final_response": "I cannot process this request due to safety policies."
+        }
+    
+    return {"is_safe": True, "guardrail_reason": ""}
+
+# --- Global Output Guardrail Node ---
+def global_output_guard_node(state: AgentState) -> dict:
+    print("--- GLOBAL OUTPUT GUARDRAIL ---")
+    response = state.get("final_response", "")
+    
+    # Example logic: Ensure PII or toxic content didn't leak
+    if "Social Security" in response or "credit card" in response.lower():
+        return {"final_response": "I cannot provide that information due to safety policies."}
+    return {}
+
+# --- Updating the Main Graph Assembly ---
+# 1. Add the new nodes
+
 
 # --- 2. THE GRAPH ASSEMBLY ---
 builder = StateGraph(AgentState)
+
+builder.add_node("input_guard", global_input_guard_node)
+builder.add_node("output_guard", global_output_guard_node)
 
 builder.add_node("supervisor_router", supervisor_router)
 # Register sector nodes
@@ -112,7 +148,17 @@ builder.add_node("f1_sector", f1_sector_graph)
 builder.add_node("football_sector", football_sector_graph)  # Uncomment when available
 builder.add_node("baseball_sector", baseball_sector_graph)  # Uncomment when available
 
-builder.add_edge(START, "supervisor_router")
+builder.add_edge(START, "input_guard")
+
+builder.add_conditional_edges(
+    "input_guard",
+    lambda state: "supervisor_router" if state.get("is_safe", True) else "blocked",
+    {
+        "supervisor_router": "supervisor_router",
+        "blocked": "output_guard"
+    }
+)
+
 
 
 # Conditional routing from START: supervisor_router decides which sector to route to
@@ -127,9 +173,10 @@ builder.add_conditional_edges(
 )
 
 # After sector processing, route to END
-builder.add_edge("f1_sector", END)
-builder.add_edge("football_sector", END)  # Uncomment when available
-builder.add_edge("baseball_sector", END)  # Uncomment when available
+builder.add_edge("f1_sector", "output_guard")
+builder.add_edge("football_sector", "output_guard")  # Uncomment when available
+builder.add_edge("baseball_sector", "output_guard")  # Uncomment when available
+builder.add_edge("output_guard", END)
 # --- 4. COMPILE & EXECUTE ---
 memory = MemorySaver()
 graph = builder.compile(checkpointer= memory)

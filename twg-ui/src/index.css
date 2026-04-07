@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+@theme {
+  --color-twg-bg: #FFFFFF;
+  --color-twg-surface: #F4F4F5; /* zinc-100 */
+  --color-twg-panel: #FAFAFA; /* zinc-50 */
+  --color-twg-border: #E4E4E7; /* zinc-200 */
+  --color-twg-text: #09090B; /* zinc-950 */
+  --color-twg-muted: #71717A; /* zinc-500 */
+  --color-twg-dark: #18181B; /* zinc-900 for high contrast */
+  --color-twg-neon: #D4FF00; /* TWG Signature Accent */
+}
+
 @layer base {
   html,
   body,
@@ -7,9 +18,8 @@
     @apply h-full;
   }
 
-
   body {
-    @apply m-0 bg-slate-100 text-slate-900;
+    @apply m-0 bg-twg-surface text-twg-text;
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
 
@@ -19,100 +29,94 @@
 }
 
 @layer components {
+  /* Crisp, dense layout on a light background */
   .app-shell {
-    @apply min-h-screen px-4 py-6 md:px-6;
-    background:
-      radial-gradient(circle at top left, rgba(255,255,255,0.95), rgba(241,245,249,0.9) 35%, rgba(226,232,240,0.95) 100%);
+    @apply min-h-screen p-0 md:p-4 bg-twg-surface;
   }
 
   .app-frame {
-    @apply mx-auto flex h-[calc(100vh-3rem)] max-w-7xl flex-col overflow-hidden rounded-3xl border border-white/70 bg-white/80 shadow-[0_20px_60px_rgba(15,23,42,0.08)] backdrop-blur;
+    @apply mx-auto flex h-[calc(100vh-2rem)] w-full max-w-[1400px] flex-col overflow-hidden rounded border border-twg-border bg-twg-bg shadow-sm;
   }
 
   .topbar {
-    @apply flex items-center justify-between border-b border-slate-200/80 px-6 py-5;
-    background: linear-gradient(to right, rgba(255,255,255,0.95), rgba(248,250,252,0.9));
+    @apply flex items-center justify-between border-b border-twg-border bg-twg-bg px-5 py-3;
   }
 
   .eyebrow {
-    @apply mb-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500;
+    @apply mb-1 text-[10px] font-bold uppercase tracking-[0.2em] text-twg-muted;
   }
 
   .app-title {
-    @apply m-0 text-xl font-semibold tracking-tight text-slate-900;
+    @apply m-0 text-lg font-medium tracking-tight text-twg-text;
   }
 
   .status-pill {
-    @apply inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold;
+    @apply inline-flex items-center gap-2 rounded px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider border;
   }
 
   .status-dot {
-    @apply h-2.5 w-2.5 rounded-full;
+    @apply h-1.5 w-1.5 rounded-full;
   }
 
   .status-idle {
-    @apply border-emerald-200 bg-emerald-50 text-emerald-700;
+    @apply border-twg-border bg-twg-surface text-twg-muted;
   }
-
   .status-idle .status-dot {
-    @apply bg-emerald-500;
+    @apply bg-twg-muted;
   }
 
+  /* Dark pill with neon dot for streaming */
   .status-streaming {
-    @apply border-blue-200 bg-blue-50 text-blue-700;
+    @apply border-twg-dark bg-twg-dark text-white;
   }
-
   .status-streaming .status-dot {
-    @apply animate-pulse bg-blue-500;
+    @apply animate-pulse bg-twg-neon;
   }
 
   .status-waiting {
-    @apply border-amber-200 bg-amber-50 text-amber-700;
+    @apply border-amber-500/30 bg-amber-50 text-amber-700;
   }
-
   .status-waiting .status-dot {
     @apply bg-amber-500;
   }
 
   .status-error {
-    @apply border-rose-200 bg-rose-50 text-rose-700;
+    @apply border-rose-500/30 bg-rose-50 text-rose-700;
   }
-
   .status-error .status-dot {
     @apply bg-rose-500;
   }
 
   .main-grid {
-    @apply grid flex-1 gap-0 overflow-hidden lg:grid-cols-[minmax(0,1fr)_340px];
+    @apply grid flex-1 gap-0 overflow-hidden lg:grid-cols-[minmax(0,1fr)_320px];
   }
 
   .chat-panel {
-    @apply flex min-h-0 flex-col border-r border-slate-200/80;
+    @apply flex min-h-0 flex-col border-r border-twg-border bg-twg-bg;
   }
 
   .chat-scroll {
-    @apply flex-1 overflow-y-auto px-5 py-5 md:px-6 md:py-6;
+    @apply flex-1 overflow-y-auto px-5 py-5;
   }
 
   .side-panel {
-    @apply hidden min-h-0 overflow-y-auto bg-slate-50/70 p-5 lg:flex lg:flex-col lg:gap-4;
+    @apply hidden min-h-0 overflow-y-auto bg-twg-panel p-4 lg:flex lg:flex-col lg:gap-4 border-l border-twg-border;
   }
 
   .empty-state {
-    @apply mx-auto mt-16 max-w-xl rounded-3xl border border-dashed border-slate-300 bg-white/70 px-8 py-12 text-center shadow-sm;
+    @apply mx-auto mt-12 max-w-lg rounded border border-twg-border bg-twg-surface px-6 py-8 text-center;
   }
 
   .empty-orb {
-    @apply mx-auto mb-4 h-14 w-14 rounded-2xl;
-    background: linear-gradient(135deg, #0f172a, #475569);
+    @apply mx-auto mb-4 h-10 w-10 rounded border border-twg-border bg-twg-bg shadow-sm;
   }
 
   .empty-state h2 {
-    @apply mb-2 text-2xl font-semibold tracking-tight text-slate-900;
+    @apply mb-2 text-base font-medium text-twg-text;
   }
 
   .empty-state p {
-    @apply m-0 text-sm leading-6 text-slate-600;
+    @apply m-0 text-xs leading-5 text-twg-muted;
   }
 
   .message-row {
@@ -128,45 +132,48 @@
   }
 
   .message-bubble {
-    @apply max-w-[88%] rounded-2xl px-4 py-3 shadow-sm;
+    @apply max-w-[85%] rounded px-4 py-2.5;
   }
 
+  /* User gets the high-contrast dark block */
   .message-user {
-    @apply bg-slate-900 text-white;
+    @apply bg-twg-dark text-white shadow-sm;
   }
 
+  /* AI gets a crisp white block with a dark accent line */
   .message-ai {
-    @apply border border-slate-200 bg-white text-slate-800;
+    @apply border border-twg-border border-l-2 border-l-twg-dark bg-twg-bg text-twg-text shadow-sm;
   }
 
   .message-label {
-    @apply mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] opacity-70;
+    @apply mb-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-twg-muted;
   }
 
   .message-content {
-    @apply whitespace-pre-wrap text-sm leading-7;
+    @apply whitespace-pre-wrap text-[13px] leading-6;
   }
 
   .typing-shell {
-    @apply flex items-center gap-2 py-1 text-sm text-slate-500;
+    @apply flex items-center gap-2 py-1 text-xs text-twg-muted;
   }
 
   .typing-dot {
-    @apply h-2 w-2 rounded-full bg-slate-400 animate-pulse;
+    @apply h-1.5 w-1.5 rounded-full bg-twg-muted animate-pulse;
   }
 
   .typing-text {
-    @apply ml-1 text-sm;
+    @apply ml-1;
   }
 
+  /* Dark cursor for light mode */
   .streaming-cursor {
-    @apply ml-1 inline-block h-4 w-[2px] animate-pulse rounded bg-slate-400 align-middle;
+    @apply ml-1 inline-block h-3 w-[2px] animate-pulse bg-twg-dark align-middle;
   }
 
   .trace-card,
   .info-card,
   .approval-card {
-    @apply rounded-2xl border border-slate-200 bg-white p-4 shadow-sm;
+    @apply rounded border border-twg-border bg-twg-bg p-3.5 shadow-sm;
   }
 
   .trace-card-header {
@@ -175,31 +182,31 @@
 
   .trace-title,
   .approval-title {
-    @apply m-0 text-base font-semibold tracking-tight text-slate-900;
+    @apply m-0 text-sm font-medium text-twg-text;
   }
 
   .trace-meta {
-    @apply flex flex-col items-end gap-1 text-xs text-slate-500;
+    @apply flex flex-col items-end gap-1 text-[10px] text-twg-muted;
   }
 
   .trace-live {
-    @apply rounded-full bg-blue-50 px-2 py-1 font-medium text-blue-700;
+    @apply rounded bg-twg-dark px-1.5 py-0.5 font-bold text-twg-neon;
   }
 
   .trace-progress {
-    @apply mb-4 h-2 overflow-hidden rounded-full bg-slate-200;
+    @apply mb-3 h-1 overflow-hidden rounded bg-twg-border;
   }
 
   .trace-progress-bar {
-    @apply h-full rounded-full bg-slate-900 transition-all duration-300;
+    @apply h-full bg-twg-dark transition-all duration-300;
   }
 
   .trace-list {
-    @apply space-y-2;
+    @apply space-y-1.5;
   }
 
   .trace-row {
-    @apply flex items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2;
+    @apply flex items-center justify-between gap-2 rounded border border-twg-border bg-twg-surface px-2.5 py-1.5;
   }
 
   .trace-node-wrap {
@@ -207,11 +214,11 @@
   }
 
   .trace-node-indicator {
-    @apply h-2.5 w-2.5 shrink-0 rounded-full;
+    @apply h-1.5 w-1.5 shrink-0 rounded-full;
   }
 
   .trace-node-name {
-    @apply truncate text-sm font-medium text-slate-700;
+    @apply truncate text-[11px] font-mono text-twg-text;
   }
 
   .trace-completed {
@@ -219,11 +226,11 @@
   }
 
   .trace-running {
-    @apply animate-pulse bg-blue-500;
+    @apply animate-pulse bg-twg-dark;
   }
 
   .trace-pending {
-    @apply bg-slate-300;
+    @apply bg-twg-muted;
   }
 
   .trace-failed {
@@ -231,70 +238,68 @@
   }
 
   .trace-badge {
-    @apply rounded-full px-2.5 py-1 text-[11px] font-semibold capitalize;
+    @apply rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider;
   }
 
   .trace-badge-completed {
-    @apply bg-emerald-50 text-emerald-700;
+    @apply bg-emerald-50 text-emerald-700 border border-emerald-200;
   }
 
   .trace-badge-running {
-    @apply bg-blue-50 text-blue-700;
+    @apply bg-twg-dark text-twg-neon;
   }
 
   .trace-badge-pending {
-    @apply bg-slate-100 text-slate-600;
+    @apply bg-twg-surface text-twg-muted border border-twg-border;
   }
 
   .trace-badge-failed {
-    @apply bg-rose-50 text-rose-700;
+    @apply bg-rose-50 text-rose-700 border border-rose-200;
   }
 
   .approval-header {
-    @apply mb-3 flex items-start gap-3;
+    @apply mb-2 flex items-start gap-2;
   }
 
   .approval-icon {
-    @apply flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-sm font-bold text-amber-700;
+    @apply flex h-6 w-6 items-center justify-center rounded bg-amber-100 text-xs font-bold text-amber-700;
   }
 
   .approval-body {
-    @apply rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-sm leading-6 text-amber-900;
+    @apply rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900;
   }
 
   .approval-actions {
-    @apply mt-4 flex flex-wrap gap-3;
+    @apply mt-3 flex flex-wrap gap-2;
   }
 
+  /* Primary buttons use the dark background with neon text */
   .primary-btn {
-    @apply rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply rounded bg-twg-dark px-4 py-2 text-xs font-bold uppercase tracking-wider text-twg-neon transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .secondary-btn {
-    @apply rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply rounded border border-twg-border bg-twg-surface px-4 py-2 text-xs font-bold uppercase tracking-wider text-twg-text transition hover:bg-twg-border disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .composer {
-    @apply border-t border-slate-200/80 bg-white/90 p-4;
+    @apply border-t border-twg-border bg-twg-bg p-4;
   }
 
   .composer-inner {
-    @apply flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50/80 p-2;
+    @apply flex items-center gap-2 rounded border border-twg-border bg-twg-surface p-1.5 focus-within:border-twg-dark focus-within:bg-white transition-colors shadow-sm;
   }
 
   .composer-input {
-    @apply w-full border-0 bg-transparent px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:opacity-60;
+    @apply w-full border-0 bg-transparent px-2 py-1.5 text-[13px] text-twg-text outline-none placeholder:text-twg-muted disabled:cursor-not-allowed disabled:opacity-60;
   }
 
+  /* Send button matches primary button styling */
   .composer-button {
-    @apply rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50;
-  }
-
-  .info-list {
-    @apply m-0 list-disc space-y-2 pl-5 text-sm leading-6 text-slate-600;
+    @apply rounded bg-twg-dark px-5 py-2 text-xs font-bold uppercase tracking-wider text-twg-neon transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .error-banner {
-    @apply mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700;
+    @apply mt-3 rounded border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700;
   }
 }

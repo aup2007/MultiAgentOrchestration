@@ -60,6 +60,7 @@ load_dotenv()
 # === LLM & DB SETUP ===
 extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150)
 sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000)
+synthesis_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
 
 # Restrict the SQL Agent to ONLY the 5 Dodgers tables
 dodgers_tables = [
@@ -103,8 +104,13 @@ def safe_sql_invoke(prompt_dict: dict):
 
 
 def parse_json_safely(text: str) -> dict:
-    """Helper to strip markdown backticks from LLM JSON output."""
+    """Helper to extract and parse JSON even if the LLM adds extra text."""
     try:
+        # Try to extract JSON object from text using regex
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        # Fallback: try direct parsing
         cleaned = text.replace("```json", "").replace("```", "").strip()
         return json.loads(cleaned)
     except Exception as e:
@@ -306,16 +312,17 @@ def baseball_query_db_node(state: BaseballSubState) -> dict:
     category = entities.get("category", "batting")
     
     # Map category to the exact table name for existence check
-    category_to_table = {
+    VALID_TABLES = {
         "batting": "dodgers_batting_season",
         "pitching": "dodgers_pitching_season",
         "team": "dodgers_game_logs",
-        "statcast": "dodgers_statcast"
+        "statcast": "dodgers_statcast",
+        "roster": "dodgers_roster"
     }
-    table_name = category_to_table.get(category, "dodgers_batting_season")
-    
+    table_name = VALID_TABLES.get(category, "dodgers_batting_season")
+
     # Fast existence check to save 70B tokens
-    if year:
+    if year and table_name in VALID_TABLES.values():
         try:
             with engine.connect() as conn:
                 count = conn.execute(text(f"SELECT COUNT(*) FROM {table_name} WHERE season_year = :y"), {"y": year}).scalar()
@@ -429,8 +436,8 @@ def baseball_finalize_node(state: BaseballSubState) -> dict:
     """
     
     try:
-        # Use your initialized LLM to clean up the output
-        clean_response = extract_llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        # Use synthesis LLM for better quality responses
+        clean_response = synthesis_llm.invoke([HumanMessage(content=synthesis_prompt)]).content
         return {"final_response": clean_response}
     except Exception as e:
         # Fallback to raw result if the LLM fails so the user gets *something*

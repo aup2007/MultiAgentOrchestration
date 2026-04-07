@@ -177,7 +177,9 @@ async def stream_chat_agentic(
         "query": query,
         "user_role": user_role,
         "domain_detected": "",
-        "final_response": ""
+        "final_response": "",
+        "is_safe": True,
+        "guardrail_reason": ""
     }
 
     try:
@@ -385,33 +387,36 @@ async def chat_resume(request: Request) -> dict:
     """Resumes the paused graph from memory when the user clicks Approve."""
     # Note: In production, extract user_role dynamically from headers
     payload = await request.json()
-    
+
     # 2. Use the EXACT thread_id that was used in the /chat/stream endpoint
     # (Falling back to "session_user" just in case you are hardcoding it everywhere)
     thread_id = payload.get("thread_id", "session_user")
     config = {"configurable": {"thread_id": thread_id}}
-    
+
     try:
         resume_value = payload.get("action", "approved")
-        # Pass None to resume from the breakpoint
-        for event in graph.stream(Command(resume=resume_value), config):
-            pass 
-            
-        final_state = graph.get_state(config)
+
+        # Keep resuming until graph finishes (no more pauses)
+        while True:
+            # Resume from the breakpoint
+            for event in graph.stream(Command(resume=resume_value), config):
+                pass
+
+            # Check if graph is still paused
+            final_state = graph.get_state(config)
+            if not final_state.next:
+                # Graph finished, no more pauses
+                break
+            # If still paused, resume again automatically
+            logger.info(f"Graph paused again at {final_state.next}, resuming...")
+
         values = final_state.values
-        
-        # Safely extract the final response based on which sector handled it
-        if "football_sector" in values:
-            answer = values["football_sector"].get("final_response")
-        elif "f1_sector" in values:
-            answer = values["f1_sector"].get("final_response")
-        elif "baseball_sector" in values:
-            answer = values["baseball_sector"].get("final_response")
-        else:
-            answer = values.get("final_response", "Process complete.")
-            
+
+        # Extract the final response from the shared AgentState
+        answer = values.get("final_response", "Process complete.")
+
         return {"status": "success", "final_response": answer}
-        
+
     except Exception as e:
         logger.error(f"Resume checkpoint crash: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

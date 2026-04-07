@@ -43,6 +43,7 @@ def parse_json_safely(text: str) -> dict:
         return {"league": None, "team": None, "year": None, "is_live": False}
 
 # === 3. DIRECT API TOOLS (Mocked for testing) ===
+@tool
 def get_league_standings(league_name: str, season: int) -> str:
     """
     Fetches the current Premier League standings, points, wins, and goal differential.
@@ -85,16 +86,63 @@ def get_league_standings(league_name: str, season: int) -> str:
 
 
 @tool
+def get_team_matches(team_name: str, status: str = "FINISHED") -> str:
+    """
+    Fetches recent match history for a team (completed matches, upcoming matches, etc).
+    Use this when the user asks about past games, last match, upcoming fixtures, etc.
+
+    Args:
+        team_name: Team name (e.g., "Chelsea")
+        status: Match status - "FINISHED" (past games), "SCHEDULED" (upcoming), "IN_PLAY" (live)
+    """
+    print(f"\n>>> [API CALL] Fetching {status} matches for Chelsea (ID: 61)...")
+
+    api_key = os.getenv("FOOTBALL_DATA_API_KEY")
+    headers = {"X-Auth-Token": api_key}
+
+    # 61 is Chelsea's exact ID. Fetch recent matches (completed, upcoming, or live)
+    url = f"https://api.football-data.org/v4/teams/61/matches?status={status}&limit=10"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            return json.dumps({"error": f"API returned {response.status_code}: {response.text}"})
+
+        data = response.json()
+        matches = data.get("matches", [])
+
+        if not matches:
+            return json.dumps({"message": f"No {status.lower()} matches found for Chelsea"})
+
+        # Parse the most recent matches
+        condensed_matches = []
+        for match in matches[:5]:  # Last 5 matches
+            condensed_matches.append({
+                "date": match['utcDate'],
+                "home_team": match['homeTeam']['name'],
+                "away_team": match['awayTeam']['name'],
+                "home_score": match['score']['fullTime']['home'],
+                "away_score": match['score']['fullTime']['away'],
+                "status": match['status']
+            })
+
+        return json.dumps(condensed_matches)
+
+    except Exception as e:
+        return json.dumps({"error": f"Failed to fetch matches: {str(e)}"})
+
+
+@tool
 def get_live_match_data(team_name: str) -> str:
     """
     Fetches live, in-game match statistics and current scores for Chelsea.
     Use this ONLY if the user asks about a game happening "right now" or "today".
     """
     print(f"\n>>> [API CALL] Fetching live match data for Chelsea (ID: 61)...")
-    
+
     api_key = os.getenv("FOOTBALL_DATA_API_KEY")
     headers = {"X-Auth-Token": api_key}
-    
+
     # 61 is Chelsea's exact ID. We filter for matches happening RIGHT NOW.
     url = "https://api.football-data.org/v4/teams/61/matches?status=IN_PLAY"
     
@@ -111,8 +159,13 @@ def get_live_match_data(team_name: str) -> str:
             
         # If they are playing, grab the current match
         match = matches[0]
-        score = match['score']['fullTime'] 
-        
+
+        # For IN_PLAY matches, use current score; for others, use fullTime
+        if match['status'] == 'IN_PLAY':
+            score = match['score'].get('current', match['score'].get('fullTime', {}))
+        else:
+            score = match['score']['fullTime']
+
         return json.dumps({
             "status": match['status'],
             "home_team": match['homeTeam']['name'],
@@ -123,17 +176,22 @@ def get_live_match_data(team_name: str) -> str:
     except Exception as e:
         return json.dumps({"error": f"Failed to connect to API: {str(e)}"})
 # === 4. AGENT EXECUTOR SETUP ===
-football_tools = [get_league_standings, get_live_match_data]
+football_tools = [get_league_standings, get_team_matches, get_live_match_data]
 
-system_prompt = """You are the Official TWG Global Chelsea FC Analyst. 
-CRITICAL RULE: You are ONLY allowed to answer questions about Chelsea FC. 
+system_prompt = """You are the Official TWG Global Chelsea FC Analyst.
+CRITICAL RULE: You are ONLY allowed to answer questions about Chelsea FC.
 If the user asks about ANY other team (like Arsenal, Spurs, etc.) without relating it to a Chelsea fixture, you must politely refuse, do not call any tools, and state that your mandate is strictly limited to Chelsea FC.
 
+TOOL SELECTION GUIDE:
+- For questions about "last game", "past match", "previous result": use get_team_matches with status=FINISHED
+- For questions about "upcoming", "next match", "fixture": use get_team_matches with status=SCHEDULED
+- For questions about "live score", "right now", "today's game": use get_live_match_data
+- For questions about "league standings", "position", "points", "table": use get_league_standings
+
 Rules:
-1. Read the user's question carefully.
-2. Choose the correct API tool.
-3. Base your final answer strictly on the API JSON response.
-4. Do not invent scores or standings."""
+1. Read the user's question carefully and choose the appropriate tool above.
+2. Base your final answer strictly on the API JSON response.
+3. Do not invent scores or standings."""
 
 # create_react_agent completely replaces the old AgentExecutor
 football_agent_executor = create_react_agent(
@@ -155,7 +213,7 @@ def football_extract_node(state: FootballSubState) -> dict:
     Extract these entities:
     - league (e.g., "Premier League")
     - team (e.g., "Arsenal")
-    - year (Integer, default to 2024 if current/now is implied)
+    - year (Integer, default to 2026 if current/now is implied)
     - is_live (Boolean: true if asking for a live score right now)
 
     Respond with ONLY a valid JSON object. No markdown, no notes.

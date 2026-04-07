@@ -198,7 +198,9 @@ def run_sports_ai(user_query: str):
         "query": user_query,
         "user_role": "admin",
         "domain_detected": "",
-        "final_response": ""
+        "final_response": "",
+        "is_safe": True,
+        "guardrail_reason": ""
     }
     
     print(f"\n>>> QUERY: {user_query}")
@@ -209,14 +211,26 @@ def run_sports_ai(user_query: str):
                 print(f"RESULT: {state_update['final_response']}")
 
 if __name__ == "__main__":
-    # run_sports_ai("Where does Chelsea currently sit in the Premier League table?")
-
+    import sys
 
     config = {"configurable": {"thread_id": "cli_test_1"}}
-    
-    query = "Where does Chelsea currently sit in the Premier League table?"
-    initial_state = {"query": query}
-    
+
+    # Accept query from command-line argument or stdin
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        query = input("Enter your sports query: ")
+
+    initial_state = {
+        "messages": [],
+        "query": query,
+        "user_role": "admin",
+        "domain_detected": "",
+        "final_response": "",
+        "is_safe": True,
+        "guardrail_reason": ""
+    }
+
     print(f"\n>>> QUERY: {query}")
     
     # 2. Run the graph until it finishes OR hits a breakpoint
@@ -236,7 +250,8 @@ if __name__ == "__main__":
         if not current_state.next:
             print("\n==================================================")
             print("✅ FINAL RESULT:")
-            result = current_state.values.get('football_sector', {}).get('final_response', "No response generated.")
+            # Dynamically extract from whichever sector handled it
+            result = current_state.values.get('final_response', "No response generated.")
             print(result)
             print("==================================================")
             break

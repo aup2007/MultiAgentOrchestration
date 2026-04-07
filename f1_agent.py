@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
@@ -70,8 +71,13 @@ def safe_sql_invoke(prompt_dict: dict):
 
 
 def parse_json_safely(text: str) -> dict:
-    """Helper to strip markdown backticks from LLM JSON output."""
+    """Helper to extract and parse JSON even if the LLM adds extra text."""
     try:
+        # Try to extract JSON object from text using regex
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        # Fallback: try direct parsing
         cleaned = text.replace("```json", "").replace("```", "").strip()
         return json.loads(cleaned)
     except Exception as e:
@@ -220,8 +226,8 @@ def f1_extract_node(state: F1SubState) -> dict:
     response = safe_extract_invoke(extraction_prompt)
 
     try:
-        entities = json.loads(response)
-    except json.JSONDecodeError:
+        entities = parse_json_safely(response)
+    except Exception as e:
         logger.warning(f"Failed to parse extraction response: {response}")
         entities = {"year": None, "event_name": None, "driver": None, "team": None, "lap_number": None}
 

@@ -28,8 +28,8 @@ class FootballSubState(TypedDict):
 load_dotenv()
 
 # === 2. LLM SETUP ===
-extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150)
-api_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000)
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150, streaming=True)
+api_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=True)
 
 def parse_json_safely(text: str) -> dict:
     """Helper to extract and parse JSON even if the LLM adds text."""

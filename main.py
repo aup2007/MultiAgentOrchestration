@@ -14,7 +14,8 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 logger = logging.getLogger(__name__)
 
 # Use a faster, lighter model for routing (lower latency for classification)
-router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0,max_tokens=20)
+router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=20, streaming=True)
+# Note: llama-prompt-guard is a classification model and does NOT support streaming
 safety_checker = ChatGroq(model="meta-llama/llama-prompt-guard-2-22m", temperature=0)
 
 # Define valid sectors
@@ -94,10 +95,8 @@ Output format: plain text sector name or JSON: {"sector": "sector_name"}"""
         logger.info(f"Query: '{user_query}' → Routed to: {sector}")
         print(f">>> ROUTING TO: {sector}")
         return {
-            "domain_detected": sector,
-            "messages": state.get("messages", []) + [
-                AIMessage(content=f" Routed to {sector}")
-            ]
+            "domain_detected": sector
+            # Don't add routing message to messages - prevents concatenation with final response
         }
 
     except Exception as e:

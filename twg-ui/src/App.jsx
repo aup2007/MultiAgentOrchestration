@@ -239,16 +239,6 @@ export default function App() {
 
           <aside className="side-panel">
             <TracePanel activeTrace={activeTrace} isStreaming={isStreaming} />
-
-            <section className="info-card">
-              <p className="eyebrow">Why this feels faster</p>
-              <ul className="info-list">
-                <li>Immediate assistant placeholder before first token</li>
-                <li>Live token streaming with cursor feedback</li>
-                <li>Node progress visible while answer is being formed</li>
-                <li>Approval checkpoint separated from normal messaging flow</li>
-              </ul>
-            </section>
           </aside>
         </main>
       </div>

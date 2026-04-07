@@ -36,11 +36,11 @@ load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
 
-extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=100)
-sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000)
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=100, streaming=True)
+sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=True)
 
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, streaming= True)
 f1_db = SQLDatabase(engine, include_tables=["f1_telemetry"])
 
 # Use the same SQL agent for querying
@@ -450,9 +450,10 @@ def f1_decision_node(state: F1SubState) -> dict:
     return {}
 
 
-def f1_finalize_node(state: F1SubState) -> dict:
+async def f1_finalize_node(state: F1SubState) -> dict:
     """
     NODE 4: Finalize the response. Synthesizes the SQL Agent's output into Natural Language.
+    Uses async streaming to accumulate tokens from the LLM.
     """
     print("--- NODE 4: Finalize Response ---")
 
@@ -473,21 +474,25 @@ def f1_finalize_node(state: F1SubState) -> dict:
     # SYNTHESIS STEP: Convert the raw SQL agent output into a conversational answer
     synthesis_prompt = f"""
     You are an expert F1 commentator.
-    
+
     User Question: {user_query}
     Raw Database Output: {db_result}
-    
+
     Synthesize the 'Raw Database Output' into a concise, conversational answer for the fan.
-    
+
     CRITICAL RULES:
     1. Answer the question directly using ONLY the provided data.
     2. NEVER mention databases, tables, SQL queries, columns, or rows.
     3. NEVER say "The query returned", "Based on the data", or "The strategy is as follows:".
     """
-    
+
     try:
-        # Uses the GPT-OSS-120b llm already defined at the top of your file
-        clean_response = llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        # Use astream to collect tokens for true streaming support
+        response_chunks = []
+        async for chunk in llm.astream([HumanMessage(content=synthesis_prompt)]):
+            if hasattr(chunk, 'content') and chunk.content:
+                response_chunks.append(chunk.content)
+        clean_response = "".join(response_chunks)
         return {"final_response": clean_response}
     except Exception as e:
         logger.error(f"Synthesis failed: {e}")

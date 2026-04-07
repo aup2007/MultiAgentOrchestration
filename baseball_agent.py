@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 import pandas as pd
 import pybaseball
 from typing import Any, TypedDict
@@ -58,9 +59,9 @@ class BaseballSubState(TypedDict):
 load_dotenv()
 
 # === LLM & DB SETUP ===
-extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150)
-sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000)
-synthesis_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150, streaming=True)
+sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=True)
+synthesis_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, streaming=True)
 
 # Restrict the SQL Agent to ONLY the 5 Dodgers tables
 dodgers_tables = [
@@ -403,44 +404,49 @@ def baseball_decision_node(state: BaseballSubState) -> dict:
     print(">>> ✅ Data verified. Moving to Finalize.")
     return {}
 
-def baseball_finalize_node(state: BaseballSubState) -> dict:
+async def baseball_finalize_node(state: BaseballSubState) -> dict:
     print("--- NODE 4: Finalize Response ---")
-    
+
     db_result = state.get("db_query_result", "")
     final_response = state.get("final_response", "")
     user_query = state.get("query", "")
 
     # 1. If an error message was already generated, pass it through
-    if final_response: 
+    if final_response:
         return {"final_response": final_response}
-    
+
     # 2. Handle empty results
     if not db_result or "no_data_in_db" in db_result.lower():
         return {"final_response": "I couldn't find the requested Dodgers data in the database."}
 
     # 3. SYNTHESIS: Convert SQL jargon into Natural Language
-    
+
     synthesis_prompt = f"""
     You are a professional LA Dodgers analyst and commentator.
-    
+
     User Question: {user_query}
     Raw Database Data: {db_result}
-    
+
     Based ONLY on the 'Raw Database Data', provide a conversational and concise answer.
-    
+
     STRICT RULES:
     - NEVER mention table names (e.g., 'dodgers_statcast'), SQL, or columns.
     - NEVER say 'The query returned' or 'Based on the data provided'.
     - If the data is a list of players/stats, present them naturally.
     - Keep the tone professional but fan-friendly.
     """
-    
+
     try:
-        # Use synthesis LLM for better quality responses
-        clean_response = synthesis_llm.invoke([HumanMessage(content=synthesis_prompt)]).content
+        # Use astream to collect tokens for true streaming support
+        response_chunks = []
+        async for chunk in synthesis_llm.astream([HumanMessage(content=synthesis_prompt)]):
+            if hasattr(chunk, 'content') and chunk.content:
+                response_chunks.append(chunk.content)
+        clean_response = "".join(response_chunks)
         return {"final_response": clean_response}
     except Exception as e:
         # Fallback to raw result if the LLM fails so the user gets *something*
+        logger.error(f"Synthesis failed: {e}")
         return {"final_response": db_result}
 
 # === GRAPH ASSEMBLY ===

@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from langchain_core.messages import HumanMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage, AIMessageChunk, AIMessage
 from langgraph.graph import StateGraph, END, START
 from state import AgentState
 from f1_agent import f1_sector_graph
@@ -159,7 +159,7 @@ async def stream_chat_agentic(
     1. Node execution trace (updates stream)
     2. LLM token chunks (messages stream)
 
-    Emits SSE events in real-time.
+    Emits SSE events in real-time with token deduplication and async finalize support.
 
     Args:
         query: User's natural language query
@@ -183,9 +183,11 @@ async def stream_chat_agentic(
     }
 
     try:
-        # Track active node for status display
+        # Track node execution state for proper UI updates
         active_node = None
+        previous_node = None
         final_text_sent = False
+        last_token_hash = None  # For token deduplication
 
         # Stream with dual modes: updates (node trace) + messages (tokens)
         async for event in graph.astream(
@@ -203,11 +205,17 @@ async def stream_chat_agentic(
             if stream_type == "updates":
                 # data = {node_name: {state_update}}
                 for node_name, node_state in data.items():
+                    # Mark previous node as completed when a new node starts
+                    if previous_node and previous_node != node_name:
+                        yield emit_update(previous_node, status="completed")
+                        logger.info(f"Node completed: {previous_node}")
+
                     active_node = node_name
+                    previous_node = node_name
                     logger.info(f"Node: {node_name}")
 
-                    # Emit node start event
-                    yield emit_update(node_name, status="executing")
+                    # Emit node start event with 'running' status (matches frontend expectations)
+                    yield emit_update(node_name, status="running")
 
                     # Small delay to let frontend update UI
                     await asyncio.sleep(0.01)
@@ -221,17 +229,27 @@ async def stream_chat_agentic(
             # STREAM 2: MESSAGES (Token Stream)
             # ================================================================
             elif stream_type == "messages":
-                # data = [AIMessageChunk(...), AIMessageChunk(...), ...]
+                # data = [AIMessageChunk(...), AIMessageChunk(...), ...] or [AIMessage(...)]
                 for message_chunk in data:
+                    token = None
+
+                    # Handle both AIMessageChunk (streaming tokens) and AIMessage (final output)
                     if isinstance(message_chunk, AIMessageChunk):
                         token = message_chunk.content
+                    elif isinstance(message_chunk, AIMessage):
+                        # Support async finalize nodes that emit AIMessage
+                        token = getattr(message_chunk, 'content', None)
 
-                        # Emit token event
-                        if token:
+                    # Emit token event with deduplication to prevent stuttering
+                    if token:
+                        token_hash = hash(token)
+                        if token_hash != last_token_hash:  # Avoid duplicate tokens
                             yield emit_message(token, is_final=False)
+                            last_token_hash = token_hash
+                            logger.debug(f"Streamed token: {token[:50] if len(token) > 50 else token}")
 
-                        # Small delay for smooth streaming
-                        await asyncio.sleep(0.001)
+                    # Small delay for smooth streaming UX
+                    await asyncio.sleep(0.001)
 
         # Signal completion
         current_state = graph.get_state(config)
@@ -245,7 +263,7 @@ async def stream_chat_agentic(
             logger.info("Stream completed successfully")
             yield emit_message("", is_final=True)
 
-        # Final node completion status
+            # Final node completion status
             if active_node:
                 yield emit_update(active_node, status="completed")
 

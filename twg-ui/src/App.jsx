@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useSportsAgent } from './useSportsAgent';
-
+import twgLogo from './assets/twgLogo.png';
 function StatusPill({ isStreaming, hitlWaiting, hasError }) {
   let label = 'Idle';
   let className = 'status-pill status-idle';
@@ -167,9 +167,17 @@ export default function App() {
     <div className="app-shell">
       <div className="app-frame">
         <header className="topbar">
-          <div>
-            <p className="eyebrow">Sports intelligence console</p>
-            <h1 className="app-title">TWG Sports Intelligence</h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+            {/* Add the logo image here */}
+            <img src={twgLogo} alt="TWG Logo" style={{ height: '40px', width: 'auto' }} />
+            
+            <div>
+              {/* Change "Sports intelligence console" here */}
+              <p className="eyebrow">TWG Sports Sector Console</p>
+              
+              {/* Change "TWG Sports Intelligence" here */}
+              <h1 className="app-title" style={{ color: '#FACC15' }}>Formula 1, Baseball, Football</h1>
+            </div>
           </div>
 
           <StatusPill

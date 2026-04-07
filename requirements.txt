@@ -118,3 +118,5 @@ yfinance==1.2.0
 zstandard==0.25.0
 uvicorn==0.27.1
 fastapi
+psycopg2-binary
+sqlalchemy

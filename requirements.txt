@@ -64,7 +64,7 @@ narwhals==2.18.1
 numpy==2.2.6
 orjson==3.11.7
 ormsgpack==1.12.2
-packaging @ file:///opt/miniconda3/conda-bld/packaging_1761049079158/work
+packaging
 pandas==2.3.3
 peewee==4.0.3
 pillow==12.1.1

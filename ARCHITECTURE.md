@@ -1,321 +1,740 @@
-# System Architecture & Design Document
-## TWG Global — Multi-Sector Sports Intelligence Platform
+# TWG Sports Intelligence Platform: Architecture Documentation
+
+**Last Updated:** April 7, 2026  
+**Owner:** Atharv Parab  
+**Status:** Production (FastAPI + LangGraph + SSE Streaming)
+**Recent Updates:** HITL Resumption Loop, JSON Parsing Robustness, State Initialization Fix
 
 ---
 
-## 1. High-Level Project Overview
+## Overview
 
-### Purpose
-The TWG platform is a **LLM-powered sports intelligence router** built for TWG Global. It solves the problem of querying heterogeneous sports datasets — Formula 1 telemetry, soccer transfer data, and baseball statistics — through a single conversational interface. A user asks a natural-language question; the system determines the relevant sports domain, fetches/caches the appropriate data, and returns a professionally-worded analytical response.
+The TWG platform is a **multi-domain LLM-powered sports intelligence system** that:
+- Routes natural-language queries to specialized agents (F1, Football, Baseball)
+- Streams responses in real-time via SSE dual-stream (node updates + token chunks)
+- Supports Human-in-the-Loop approvals for high-cost API operations
+- Persists conversation state via thread_id and LangGraph Checkpointer
 
-### Primary Tech Stack
+### Core Tech Stack
 
-| Layer | Technology | Role |
+| Layer | Technology | Purpose |
 |---|---|---|
-| **Frontend** | Streamlit | Chat UI with session-based auth |
-| **API Gateway** | FastAPI + Uvicorn | REST endpoint, routes requests to graph |
-| **Orchestration** | LangGraph + LangChain | Multi-agent state machine |
-| **LLM Inference** | Groq (`gpt-oss-120b`) | Query parsing + response generation |
-| **F1 Data Source** | FastF1 library | Official F1 telemetry API |
-| **Persistence** | PostgreSQL on Neon Cloud (AWS us-east-1) | Partitioned telemetry storage |
-| **Stub DBs** | SQLite (`transfermarkt.db`, `lahman.db`) | Planned soccer/baseball storage (not yet present) |
+| **Frontend** | React (Vite) | Real-time chat with trace visualization |
+| **API** | FastAPI + Uvicorn | HTTP + SSE streaming gateway |
+| **Orchestration** | LangGraph + LangChain | Multi-agent state machine with checkpointing |
+| **LLMs** | Groq API | Router (8B), Extraction (8B), SQL (70B), Synthesis (120B) |
+| **Safety** | Llama Guard 2 (22M) | Input/output guardrails |
+| **F1 Data** | FastF1 + Neon PostgreSQL | Telemetry with PARTITION BY year |
+| **Soccer Data** | football-data.org API | Live standings & match data |
+| **Baseball Data** | pybaseball | Dodgers statistics |
 
 ---
 
-## 2. Detailed Technical Architecture
+## 1. High-Level Flow: FastAPI + LangGraph Lifecycle
 
-### System Flow: "Day in the Life" of a Query
-
-Tracing `"What was Verstappen's fastest lap at the 2024 Monaco GP?"`:
+### 1.1 Request Lifecycle
 
 ```
-+------------------------------------------------------------------+
-|  1. USER -> Streamlit (frontend.py)                              |
-|     st.chat_input() captures query                               |
-|     session_state["token"] gates access (login wall)            |
-+------------------------------+-----------------------------------+
-                               | POST /chat  {query: "..."}
-+------------------------------v-----------------------------------+
-|  2. FastAPI (backend.py)                                         |
-|     ChatRequest Pydantic model validates shape                   |
-|     Builds partial initial_state = {"query": query}             |
-|     Calls langgraph_app.invoke(initial_state)                    |
-+------------------------------+-----------------------------------+
-                               | invoke()
-+------------------------------v-----------------------------------+
-|  3. LangGraph Router (main.py) -> supervisor_router()            |
-|     Keyword scan on lowercased query                             |
-|     "prix" keyword matches -> f1_sector                          |
-+------------------------------+-----------------------------------+
-                               | node execution
-+------------------------------v-----------------------------------+
-|  4. f1_node() (f1_agent.py)                                      |
-|                                                                  |
-|     LLM Call 1: Parse query -> extract {Year: 2024, Loc: Monaco} |
-|     check_if_data_exists(2024, "Monaco") -> PostgreSQL COUNT(*)  |
-|                                                                  |
-|     [CACHE HIT]  -> SELECT * FROM f1_telemetry WHERE ...        |
-|                     ORDER BY lap_time_seconds ASC LIMIT 1        |
-|                                                                  |
-|     [CACHE MISS] -> fastf1.get_session(2024, "Monaco", "R")     |
-|                  -> session.load() -> laps DataFrame             |
-|                  -> ensure_f1_partition(2024) [db_utils.py]      |
-|                  -> df.to_sql('f1_telemetry', engine, multi=True)|
-|                  -> retrieve fastest lap object                  |
-|                                                                  |
-|     LLM Call 2: "You are F1 analyst. Data: {lap}. Answer: {q}"  |
-+------------------------------+-----------------------------------+
-                               | state["final_response"] = result
-+------------------------------v-----------------------------------+
-|  5. LangGraph -> END node                                        |
-|     Returns full AgentState to backend.py                        |
-|     FastAPI returns {"reply": ..., "domain": "F1 Sector"}        |
-|     Streamlit renders st.chat_message("assistant").write(reply)  |
-+------------------------------------------------------------------+
+HTTP POST /chat/stream (FastAPI)
+    ↓
+ChatRequest (query, user_role, thread_id)
+    ↓
+stream_chat_agentic() → graph.astream(config)
+    ↓
+LangGraph Supervisor Router + Sector Subgraph
+    ↓
+SSE Dual-Stream Output (updates + messages)
+    ↓
+StreamingResponse (text/event-stream)
 ```
 
-**Total Latency:**
-- Cache hit: ~2.1s (dominated by 2 LLM calls at ~1s each)
-- Cache miss: ~6.1s (adds ~3s FastF1 API + ~1s bulk insert)
+### 1.2 Supervisor-Router Pattern
+
+The **main graph** (in `main.py`) implements a hierarchical routing pattern:
+
+```
+START
+  ↓
+input_guard (Llama Guard 2 - safety check)
+  ↓
+supervisor_router (LLM-based intent classifier)
+  ├─→ "f1_sector" (Formula 1)
+  ├─→ "football_sector" (Soccer)
+  └─→ "baseball_sector" (Baseball)
+  ↓
+output_guard (PII/toxicity filter)
+  ↓
+END
+```
+
+**Key Implementation** (`main.py:62-105`):
+- Uses `ChatGroq(llama-3.1-8b-instant)` for fast routing
+- Parses LLM response with fallback to `DEFAULT_SECTOR` ("f1_sector")
+- Returns `domain_detected` field that drives conditional routing
+- Decorated with `@retry` (exponential backoff, max 3 attempts)
+
+### 1.3 SSE Dual-Stream Output
+
+The `/chat/stream` endpoint (`backend_streaming.py:349-379`) emits two parallel event streams:
+
+1. **"update" events** (Thought Trace)
+   - Emitted when nodes execute
+   - Contains: `{type: "update", data: {node: "extract", status: "executing"}}`
+   - Frontend displays in **Trace Panel**
+
+2. **"message" events** (Token Stream)
+   - Emitted when LLM produces tokens
+   - Contains: `{type: "message", data: {token: "...", is_final: false}}`
+   - Frontend appends to chat bubble in real-time
+
+**Stream Implementation** (`backend_streaming.py:189-232`):
+```python
+async for event in graph.astream(initial_state, config, stream_mode=["updates", "messages"]):
+    stream_type, data = event
+    
+    if stream_type == "updates":
+        # Node execution trace → emit_update()
+    elif stream_type == "messages":
+        # LLM tokens → emit_message()
+```
 
 ---
 
-### Component Breakdown
+## 2. State & Memory: Thread-Based Persistence
 
-**`state.py`** — The Shared Contract
+### 2.1 AgentState Definition
+
+All state flows through a single **AgentState** (in `state.py`):
 
 ```python
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+    messages: Annotated[Sequence[BaseMessage], operator.add]  # Append-only
     query: str
     user_role: str
     domain_detected: str
     final_response: str
+    is_safe: bool
+    guardrail_reason: str
 ```
 
-Every node in the graph reads from and writes to this TypedDict. The `Annotated[..., operator.add]` on `messages` is a LangGraph reducer: when multiple nodes emit message updates, LangGraph merges them by concatenation rather than overwriting. This is the only field with a custom reducer — all others follow last-write-wins semantics.
+**Key Properties:**
+- `messages` uses `operator.add` → automatically concatenates across nodes
+- `domain_detected` → stores the sector selected by supervisor_router
+- `is_safe` → set by input_guard; if false, flow routes to "blocked" path
 
-**`main.py`** — The Orchestration Brain
+### 2.2 Memory Saver Checkpointer
 
-Builds the LangGraph `StateGraph`. Key insight: `add_conditional_edges` from `START` means the router runs *before* any node executes. The edge mapping `{"soccer_sector": "f1_sector", "baseball_sector": "f1_sector"}` is the current stub wiring — all three return values of the routing function point to the same node.
+The platform uses **LangGraph's MemorySaver** for cross-session persistence:
 
-**`db_utils.py`** — The Partitioning Engine
+```python
+# main.py:181-182
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
+```
 
-Creates and manages the `f1_telemetry` parent table and yearly child partition tables. The logic exists inside `ensure_f1_partition()`, which checks `pg_tables` before issuing DDL — this is idempotent by design, safe to call on every cache-miss path.
-
-**`f1_agent.py`** — The Only Live Agent
-
-The only fully implemented domain agent. It does triple duty: (1) LLM-based structured extraction, (2) cache-or-fetch data retrieval, (3) LLM-based response synthesis.
-
-**`backend.py`** — The Thin Gateway
-
-FastAPI server with two routes. Notable: it builds only `{"query": request.query}` as the initial state, leaving `messages`, `user_role`, and `domain_detected` unset. LangGraph tolerates this only because the F1 node doesn't read those fields during normal execution.
-
-**`frontend.py`** — The Session-Gated UI
-
-Streamlit uses `st.session_state` as its in-memory store. The login gate is implemented as a conditional on `st.session_state["token"] is None`, with `st.rerun()` forcing a page reload post-authentication. The token is sent as a Bearer header but never validated by the backend.
-
----
-
-## 3. Design Choices & Patterns
-
-### Data Strategy: PostgreSQL Partitioning
-
-The most architecturally deliberate decision in the codebase is in `db_utils.py:ensure_f1_partition()`:
-
-```sql
-CREATE TABLE IF NOT EXISTS f1_telemetry (
-    id SERIAL,
-    year INT NOT NULL,
+**Thread Configuration** (`backend_streaming.py:172`):
+```python
+config = {"configurable": {"thread_id": thread_id}}
+initial_state = {
+    "messages": [HumanMessage(content=query)],
+    "query": query,
+    "user_role": user_role,
     ...
-    PRIMARY KEY (id, year)
-) PARTITION BY RANGE (year);
+}
 
-CREATE TABLE f1_laps_2024 PARTITION OF f1_telemetry
-    FOR VALUES FROM (2024) TO (2025);
-```
-
-**Why this choice:** F1 telemetry is naturally time-series data. By partitioning on `year`, PostgreSQL's query planner performs **partition pruning** — a query for 2024 data never touches `f1_laps_2025`. This also means bulk inserts for a new season go into an isolated partition, avoiding lock contention on historical data. The `PRIMARY KEY (id, year)` includes `year` because PostgreSQL requires partition keys to be part of the primary key in declarative partitioning.
-
-**The two-tier cache:** FastF1 has its own file-based local cache, which the code explicitly disables (`Cache.set_disabled()`) before syncing and re-enables after. This forces fresh data from the F1 API during sync operations, while the PostgreSQL layer serves as the durable, shared cache across all users and requests.
-
-**No indexing defined:** The current schema has no secondary indexes on `driver`, `event_name`, or `lap_time_seconds`. The fastest-lap query uses `ORDER BY lap_time_seconds ASC LIMIT 1`, which will perform a full partition scan. At F1 scale (~1,000 laps per race, ~23 races/year), this is acceptable; at large scale it would warrant a B-tree index on `(year, event_name, lap_time_seconds)`.
-
-### State & Logic: LangGraph TypedDict
-
-The choice of LangGraph over a simpler chain is motivated by the multi-agent routing requirement. LangGraph represents the pipeline as a directed graph where nodes are Python functions and edges are either deterministic (`add_edge`) or conditional (`add_conditional_edges`). The state machine guarantees that:
-
-1. Each node receives a full copy of `AgentState`
-2. Node return dicts are **merged** (not replaced) into state
-3. The `operator.add` reducer on `messages` means conversation history accumulates automatically without manual list management
-
-This design allows future nodes to share context (e.g., a soccer node could read `domain_detected` set by a pre-processing node) without explicit parameter passing.
-
-### Scalability: Patterns Used
-
-| Pattern | Where | Rationale |
-|---|---|---|
-| **Supervisor Router** | `main.py:supervisor_router()` | Single decision point that fans out to specialized agents — scales by adding new keyword sets and new nodes |
-| **Strategy Pattern** | `supervisor_router()` | The routing function is a pluggable strategy; swapping keyword matching for an LLM classifier requires only changing this one function |
-| **Factory Pattern** | `f1_agent.py` | `ChatGroq(model=..., temperature=0)` creates the LLM client at module load time (effectively a module-level singleton) |
-| **Repository Pattern** | `db_utils.py` | `engine = create_engine(...)` is the single database abstraction point; all agents import this rather than creating their own connections |
-| **Cache-Aside Pattern** | `f1_node()` | Check cache first, populate on miss — the canonical read-through cache pattern |
-| **Iterator/Streaming** | `main.py:run_sports_ai()` | `graph.stream()` emits state updates node-by-node, enabling real-time output before the full graph completes |
-
-**Current scalability ceiling:** The system is single-process Uvicorn with no worker configuration. SQLAlchemy's default connection pool is 5 connections. Horizontal scaling would require externalizing LangGraph state (currently in-process memory per request) to Redis or a shared store.
-
----
-
-## 4. Multi-Agent / Service Orchestration
-
-### Current Architecture
-
-```
-START
-  |
-  v
-supervisor_router()          <- Conditional edge decision function
-  |
-  +--- "f1_sector"     -----> f1_node() ----> END
-  +--- "soccer_sector" -----> f1_node() ----> END  (stub: wired to F1)
-  +--- "baseball_sector" ---> f1_node() ----> END  (stub: wired to F1)
-```
-
-The graph is currently **linear and single-path** — no parallel fan-out, no aggregation node. The stub agents (`football_agent.py`, `baseball_agent.py`) each define a `create_sql_agent()` from LangChain, which internally implements a **ReAct loop**: the LLM reasons about what SQL to run, executes it via the `QuerySQLDataBaseTool`, observes the result, and iterates. This is a multi-step agentic pattern hidden inside a single graph node.
-
-### Guardrails & Error Handling
-
-**What exists:**
-```python
-# f1_agent.py
-try:
+# Stream execution with persistent thread
+async for event in graph.astream(initial_state, config, stream_mode=["updates", "messages"]):
     ...
-except Exception as e:
-    return {"final_response": f"F1 Cloud Sync Error: {str(e)}"}
-
-# backend.py
-except Exception as e:
-    raise HTTPException(status_code=500, detail=f"Graph Error: {str(e)}")
 ```
 
-**What's missing:**
-- No retry logic (a transient Groq API 429 will immediately surface as an error)
-- No exponential backoff on FastF1 calls
-- No circuit breaker pattern
-- No timeout guards (FastF1 `session.load()` can block indefinitely on slow connections)
-- Generic `except Exception` catches everything, including programming errors that should propagate
+**What This Enables:**
+- **Persistent Conversations:** Each `thread_id` maintains its own state snapshot
+- **HITL Resumption:** When graph pauses, state is saved; resumption replays from checkpoint
+- **Multi-User Sessions:** Each frontend session generates a unique `threadId` (UUID) on mount
+- **Cross-API Calls:** The same `thread_id` is sent to both `/chat/stream` and `/chat/resume`
 
-### Inter-Service Communication
+### 2.3 Frontend Thread Management
 
-| From | To | Protocol | Auth |
-|---|---|---|---|
-| Streamlit | FastAPI | HTTP REST (requests lib) | Bearer token (not validated) |
-| FastAPI | LangGraph | In-process function call | None |
-| f1_node | Groq API | HTTPS (LangChain SDK) | API key in env |
-| f1_node | FastF1 | HTTPS | None (public API) |
-| f1_node / db_utils | Neon PostgreSQL | TCP + SSL | Connection string in env |
+From `useSportsAgent.js:10`:
+```javascript
+const threadId = useMemo(() => crypto.randomUUID(), []);
+```
+
+- Generated **once per session** (on component mount)
+- Passed in every request: `{ query, user_role: 'admin', thread_id: threadId }`
+- Enables resumption if user clicks "Approve" after HITL interrupt
 
 ---
 
-## 5. Critical Observations
+## 3. HITL Cycle: Human-in-the-Loop Control
 
-### 1. The Backend Sends Incomplete State to LangGraph
+### 3.1 The Interrupt Pattern
 
-`backend.py` builds `initial_state = {"query": request.query}` — omitting `messages`, `user_role`, and `domain_detected`. LangGraph doesn't raise an error because `f1_node()` only reads `state["query"]`. However, if any node were added that reads `state["messages"]` (e.g., for conversation history), it would receive `None` and crash. The correct initialization is in `test_f1.py`, which includes all fields.
+When a sector node (e.g., **F1 Fetch Node**) encounters a **high-cost API call**, it sends an **interrupt** by using LangGraph's checkpointer + `Command(resume=...)`.
 
-### 2. The Router Has a Silent Default Bias
+**Detection Mechanism** (`backend_streaming.py:235-241`):
+```python
+current_state = graph.get_state(config)
+
+if current_state.next:  # current_state.next is non-empty when graph is paused
+    logger.info("Graph paused for Human-in-the-Loop.")
+    yield format_sse_event(
+        event_type="interrupt",
+        data={"message": "Waiting for API approval"}
+    )
+```
+
+**Frontend HITL Response** (`useSportsAgent.js:120-123`):
+```javascript
+if (event.type === 'interrupt') {
+    setHitlState({ isWaiting: true, data: event.data || null });
+    setIsStreaming(false);
+    return;  // Stop listening; wait for user action
+}
+```
+
+### 3.2 Resume Pattern with Command
+
+When user clicks **"Approve"**, the frontend calls `/chat/resume`:
+
+**Frontend Call** (`useSportsAgent.js:177-183`):
+```javascript
+const res = await fetch('http://localhost:8000/chat/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        thread_id: threadId,
+        action: approved ? 'approved' : 'rejected',
+    }),
+});
+```
+
+**Backend Resume Handler** (`backend_streaming.py:383-417`):
+```python
+@app.post("/chat/resume")
+async def chat_resume(request: Request) -> dict:
+    payload = await request.json()
+    thread_id = payload.get("thread_id", "session_user")
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        resume_value = payload.get("action", "approved")
+        
+        # Use Command to resume from the breakpoint
+        for event in graph.stream(Command(resume=resume_value), config):
+            pass
+        
+        final_state = graph.get_state(config)
+        values = final_state.values
+        
+        # Extract final response from sector subgraph
+        if "football_sector" in values:
+            answer = values["football_sector"].get("final_response")
+        elif "f1_sector" in values:
+            answer = values["f1_sector"].get("final_response")
+        else:
+            answer = values.get("final_response", "Process complete.")
+        
+        return {"status": "success", "final_response": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+**Key Pattern:**
+- `graph.stream(Command(resume=resume_value), config)` replays from the paused checkpoint
+- The `thread_id` in config ensures we're resuming the **correct conversation**
+- After resumption completes, we fetch the final state and extract the response
+
+### 3.3 Improved Resume Handler: Multi-Pause Loop
+
+**Enhancement (April 7, 2026):** The `/chat/resume` endpoint now properly handles **multiple pauses** in a single approval cycle. This enables self-correcting loops (like Football's QA Critic) to work seamlessly.
+
+**Previous Issue:**
+- If a sector graph looped back (e.g., `should_revise() → "api_execute"` in football_agent), it would hit `interrupt_before` again
+- The old `/chat/resume` would return after resuming once, leaving the graph paused
+- Frontend would show "execution completed" but no final response was returned
+
+**Fixed Implementation** (`backend_streaming.py:383-417`):
+```python
+@app.post("/chat/resume")
+async def chat_resume(request: Request) -> dict:
+    payload = await request.json()
+    thread_id = payload.get("thread_id", "session_user")
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        resume_value = payload.get("action", "approved")
+        
+        # Keep resuming until graph finishes (handles multiple pauses)
+        while True:
+            # Resume from the breakpoint
+            for event in graph.stream(Command(resume=resume_value), config):
+                pass
+            
+            # Check if graph is still paused
+            final_state = graph.get_state(config)
+            if not final_state.next:
+                # Graph finished, no more pauses
+                break
+            # If still paused, resume again automatically
+            logger.info(f"Graph paused again at {final_state.next}, resuming...")
+        
+        # Extract final response from shared AgentState
+        answer = values.get("final_response", "Process complete.")
+        return {"status": "success", "final_response": answer}
+```
+
+**Key Improvement:**
+- While loop continues resuming until `current_state.next` is empty (graph complete)
+- Handles sector graphs that loop back to the same `interrupt_before` node
+- Automatically approves subsequent pauses within the same approval cycle
+- Only returns to frontend when the graph is truly finished
+
+**Use Case:** Football agent's critic feedback loop:
+1. User approves → `/chat/resume` called
+2. API executes, gets standings instead of match details
+3. QA reflection detects failure, calls `should_revise()` → returns "api_execute"
+4. Graph hits `interrupt_before=["api_execute"]` again
+5. `/chat/resume` **automatically resumes** (loop continues)
+6. LLM tries again with feedback from critic
+7. Second attempt succeeds (QA passes)
+8. Loop breaks, graph finishes
+9. Final response returned to frontend
+
+### 3.4 Where Interrupts Occur
+
+Sector nodes can pause the graph by reaching a **human-approval node**. Currently used in:
+- **Football Agent:** `interrupt_before=["api_execute"]` (before API tool calling)
+- **F1 Agent:** Could be added before `fetch` node (FastF1 API call)
+- **Baseball Agent:** Could be added before expensive pybaseball fetches
+
+The pattern:
+1. Graph executes normally
+2. Before invoking expensive API, reaches `interrupt_before` node
+3. Graph pauses; `current_state.next = "api_execute"` (the paused node)
+4. Frontend receives "interrupt" event type → shows Approval Card
+5. User clicks "Approve"
+6. Frontend calls `/chat/resume` with thread_id and action
+7. Backend uses `Command(resume=action)` to continue from checkpoint
+8. Graph executes, and if it loops back to the same interrupt point, `/chat/resume` auto-resumes
+9. Stream resumes when graph finally completes, emitting final response
+
+---
+
+## 4. Sector Subgraphs: 5-Node Architecture
+
+### 4.1 F1 Sector Flow Diagram
+
+```mermaid
+graph LR
+    A["🔍 Extract<br/>(Entity Extraction)"] -->|entities| B["📋 Schema Ground<br/>(Strategy Planning)"]
+    B -->|schema_grounding| C["🗄️ Query DB<br/>(Text-to-SQL)"]
+    C -->|db_query_result| D{"✅ Has Data?"}
+    D -->|NO| E["🔗 Fetch API<br/>(FastF1 Sync)"]
+    D -->|YES| F["✨ Finalize<br/>(NL Synthesis)"]
+    E -->|data_synced| D
+    F --> END["📤 END"]
+```
+
+### 4.2 Node Details
+
+#### **Node 1: Extract** (`f1_agent.py:199-228`)
+- **Input:** `state.query` (e.g., "Who had the fastest lap at Monaco 2024?")
+- **Task:** Parse named entities from the query
+- **Output:** `entities = {year, event_name, driver, team, lap_number}`
+- **LLM:** `llama-3.1-8b-instant` (fast extraction)
+- **Fallback:** Returns None for missing fields
+
+#### **Node 1.5: Schema Ground** (`f1_agent.py:231-281`)
+- **Input:** `query` + `entities`
+- **Task:** Plan the SQL strategy against the `f1_telemetry` schema
+- **Output:** `schema_grounding = {question_type, relevant_tables, relevant_columns, strategy, needs_validation}`
+- **LLM:** `llama-3.3-70b-versatile` (heavy reasoning for planning)
+- **Purpose:** Separates query intent from execution; creates query plan artifact
+
+#### **Node 2: Query DB** (`f1_agent.py:287-359`)
+- **Input:** `entities`, `schema_grounding`, `query`
+- **Task:** Execute SQL against `f1_telemetry` table using LangChain SQL Agent
+- **Output:** `db_query_result = <SQL result or "NO_DATA_IN_DB">`
+- **LLM:** SQL Agent from LangChain (openai-tools type)
+- **Fallback:** If table is empty, returns "NO_DATA_IN_DB"
+
+#### **Node 3: Fetch API** (`f1_agent.py:362-410`) ⚠️ **HITL Checkpoint**
+- **Input:** `entities`, `db_query_result`, `fetch_attempts`
+- **Task:** Call FastF1 API, download telemetry, sync to Neon PostgreSQL
+- **Output:** `data_synced = True/False`, `fetch_attempts` incremented
+- **Max Retries:** 2 (prevents infinite loops)
+- **Safeguard:** Returns error if `fetch_attempts >= MAX_FETCH_ATTEMPTS`
+- **This is where the HITL interrupt could be triggered** (before sync)
+
+#### **Decision Node** (`f1_agent.py:413-444`)
+- **Input:** `db_query_result`, `data_synced`, `fetch_attempts`
+- **Task:** Route based on query result
+- **Output:** Conditional edge to: "query" (loop), "fetch" (sync), or "end" (finalize)
+- **Logic:**
+  ```
+  if data_synced → "query"       # Loop back, now data exists
+  elif no_data_in_db AND attempts < 2 → "fetch"  # Try to sync
+  else → "end"                    # Finalize response
+  ```
+
+#### **Node 4: Finalize** (`f1_agent.py:447-489`)
+- **Input:** `db_query_result`, `final_response`, `query`
+- **Task:** Convert raw SQL result to conversational response
+- **Output:** `final_response = <Natural language answer>`
+- **LLM:** `openai/gpt-oss-120b` (synthesis; higher quality)
+- **Safety:** Never mentions "databases", "SQL", "tables", "rows"
+
+### 4.3 Flow Control Logic
+
+The **Decision Node** implements a cycle:
 
 ```python
-def supervisor_router(state):
-    query = state["query"].lower()
-    if any(word in query for word in ["f1", "verstappen", "lap", "prix", "race"]):
-        return "f1_sector"
-    elif any(word in query for word in ["soccer", "goal", "transfer", "market"]):
-        return "soccer_sector"
-    return "baseball_sector"   # <- catches everything else, including soccer/baseball
+f1_internal_builder.add_conditional_edges(
+    "decide",
+    lambda state: (
+        "end" if state.get("final_response") else
+        "query" if state.get("data_synced") else
+        "fetch" if "no_data_in_db" in state.get("db_query_result", "").lower() 
+                   and state.get("fetch_attempts", 0) < 2 else
+        "end"
+    ),
+    {
+        "query": "query",
+        "fetch": "fetch",
+        "end": "finalize"
+    }
+)
 ```
 
-The `else` clause defaults to `"baseball_sector"`, which is then mapped to `"f1_sector"` in `add_conditional_edges`. Any query that doesn't contain the exact F1 or soccer keywords silently routes to the F1 agent, including a baseball query about Shohei Ohtani. There's no "unknown domain" path.
+**Example Flow:**
+1. Query → DB returns "NO_DATA_IN_DB"
+2. Decision → route to "fetch"
+3. Fetch → syncs data, sets `data_synced = True`
+4. Decision → detects `data_synced`, routes back to "query"
+5. Query → now finds data (re-executes SQL)
+6. Decision → detects data exists, routes to "end"
+7. Finalize → synthesizes result
 
-### 3. Module-Level LLM Instantiation Creates Silent Import-Time Side Effects
+### 4.4 Football Sector: Self-Correcting Agent with QA Critic
 
-In `f1_agent.py`, `football_agent.py`, and `baseball_agent.py`, the LLM clients and database connections are created at **module import time**, not inside the node functions. This means importing `f1_agent` immediately attempts to read `GROQ_API_KEY` from the environment and establish a SQLAlchemy engine connection. If the env var is missing at import time, the entire application fails to start with a cryptic error, not a clear configuration error.
+**Architecture** (`football_agent.py`):
+```
+START → extract → api_execute (INTERRUPT_BEFORE) → reflect → finalize → END
+                       ↑_____________________________________________|
+                       (if revision needed)
+```
 
-### 4. FastF1's Cache Toggle Pattern is a Race Condition in Concurrent Contexts
+**Node Details:**
+
+**Extract Node** (`football_agent.py:202-219`):
+- Parses: `{league, team, year, is_live}`
+- Uses `parse_json_safely()` for robust JSON extraction (handles LLM commentary)
+
+**API Execute Node** (`football_agent.py:221-251`):
+- Uses `create_react_agent` with tools:
+  - `get_league_standings(league, season)` → table data
+  - `get_team_matches(team, status="FINISHED"|"SCHEDULED"|"IN_PLAY")` → **NEW** match history
+  - `get_live_match_data(team)` → live scores
+- LLM selects appropriate tool based on TOOL SELECTION GUIDE in system prompt
+- **Safeguard:** Only answers Chelsea FC questions (system prompt enforces this)
+- **New Tool (April 7):** `get_team_matches()` fetches past/upcoming matches (solves "last game" queries)
+  - Status filter: "FINISHED" for past matches, "SCHEDULED" for upcoming
+  - Returns last 5 matches with date, teams, scores
+  - **Bug Fixed:** Now handles IN_PLAY matches correctly (uses current score instead of fullTime)
+
+**Reflection Node (QA Critic)** (`football_agent.py:253-277`):
+- **Purpose:** Validates if agent answered the user's question correctly
+- **Implementation:**
+  ```python
+  critic_prompt = """
+  You are a strict QA Manager...
+  Did the agent successfully and clearly answer the user's question?
+  - If yes, reply EXACTLY with: PASS
+  - If no, reply with a 1-sentence instruction on what it must fix.
+  """
+  ```
+- **Output:** `feedback = "PASS"` or specific instruction (e.g., "The agent must fetch the last game result, not standings")
+- **Revision Count:** Tracks iterations; max 2 revisions before forcing finalize
+
+**Routing Logic** (`football_agent.py:284-296`):
+```python
+def should_revise(state: FootballSubState):
+    feedback = state.get("feedback", "")
+    revision_count = state.get("revision_count", 0)
+    
+    if revision_count >= 2:
+        return "finalize"  # Safety: prevent infinite loops
+    
+    if feedback == "PASS":
+        return "finalize"
+    else:
+        return "api_execute"  # Loop back for retry
+```
+
+**Self-Correction Cycle Example:**
+1. User: "How was Chelsea's last game?"
+2. Extract: `{team: "Chelsea", is_live: False, league: "Premier League"}`
+3. API Execute: LLM calls `get_league_standings()` (wrong tool!)
+4. Agent returns: "Chelsea is rank 4 with 69 points"
+5. QA Reflect: "FAILED. The agent provided standings instead of the last game result. It must use get_team_matches(status=FINISHED)"
+6. **Should Revise:** Routes back to `api_execute` (loop = 1)
+7. API Execute (Retry): LLM sees feedback, calls `get_team_matches(status=FINISHED")`
+8. Agent returns: "Chelsea 2-1 Arsenal on April 5, 2026"
+9. QA Reflect: "PASS"
+10. Finalize: Returns conversational response
+
+**Human-in-the-Loop Integration:**
+- Graph pauses **before** step 3 (before api_execute)
+- Frontend shows "Approve API call" prompt
+- User clicks Approve
+- Backend calls `/chat/resume` with auto-loop resumption (handles steps 3-10)
+- Final response returned to user
+
+**Baseball Agent** (`baseball_agent.py`):
+- Uses `create_sql_agent` on Dodgers-specific tables: `dodgers_roster`, `dodgers_batting_season`, `dodgers_pitching_season`, `dodgers_game_logs`, `dodgers_statcast`
+- Schema grounding via `read_init_db_schema()` tool (reads `baseball_db_init.py`)
+- State: `BaseballSubState` with `schema_grounding`, `fetch_attempts`, `data_synced`
+- **Improvements (April 7):**
+  - Updated `parse_json_safely()` to use regex extraction (robust to LLM commentary)
+  - Added SQL safety whitelist: validates table_name against VALID_TABLES dict
+  - Upgraded synthesis LLM from `llama-3.1-8b` → `openai/gpt-oss-120b` for better response quality
+
+---
+
+## 5. Security Layer: Llama Guard + Guardrails AI
+
+### 5.1 Input Guardrail (Llama Guard 2)
+
+**Location:** `main.py:108-123` → `global_input_guard_node`
 
 ```python
-Cache.set_disabled()
-# ... do sync ...
-Cache.set_enabled()
+def global_input_guard_node(state: AgentState) -> dict:
+    query = state.get("query", "")
+    
+    # Llama Guard 2 safety classifier
+    res = safety_checker.invoke([HumanMessage(content=query)])
+    
+    if "unsafe" in res.content.lower():
+        return {
+            "is_safe": False,
+            "guardrail_reason": res.content,
+            "final_response": "I cannot process this request due to safety policies."
+        }
+    
+    return {"is_safe": True, "guardrail_reason": ""}
 ```
 
-`fastf1.Cache` is a **global module-level state**. In a concurrent server with multiple workers, one request's `set_disabled()` could affect another simultaneous request's cache behavior. The current single-threaded Uvicorn deployment makes this safe in practice, but it's a latent bug that would manifest under load.
+**LLM:** `meta-llama/llama-prompt-guard-2-22m`
+- Specialized safety classification model
+- Detects: harmful, hateful, illegal, and policy-violating content
+- **If unsafe:** Sets `is_safe=False`, routes to `output_guard` (END), blocks processing
 
-### 5. The Partition Function is Called on Every Cache Miss, But DDL is Idempotent
+**Route Logic:**
+```
+START → input_guard
+    ↓
+Is safe?
+├─→ YES → supervisor_router (proceed)
+└─→ NO → output_guard (blocked) → END
+```
 
-`ensure_f1_partition(year, engine)` runs `CREATE TABLE IF NOT EXISTS` DDL on every sync operation. This is safe (the `IF NOT EXISTS` guard prevents errors) but issues DDL on the hot path. In production, partitions should be pre-created via a migration or a scheduled job, not during request handling.
+### 5.2 Output Guardrail (Guardrails AI-style PII Check)
 
-### 6. LangGraph's `graph.stream()` vs. `graph.invoke()` — Two Different Interfaces
+**Location:** `main.py:125-133` → `global_output_guard_node`
 
-`main.py:run_sports_ai()` uses `graph.stream()` (an iterator that yields intermediate states), while `backend.py` uses `langgraph_app.invoke()` (returns the final state dict). These are not interchangeable. The `run_sports_ai()` function is a debugging/CLI utility; the actual production path through `invoke()` in `backend.py` is what users hit. A developer reading only `main.py` would see streaming and assume that's the execution model.
+```python
+def global_output_guard_node(state: AgentState) -> dict:
+    response = state.get("final_response", "")
+    
+    # Example: Ensure PII or toxic content didn't leak
+    if "Social Security" in response or "credit card" in response.lower():
+        return {"final_response": "I cannot provide that information due to safety policies."}
+    return {}
+```
 
-### 7. The Soccer/Baseball Agents Would Fail Even If Wired Correctly
+**Current Implementation:**
+- Regex-based PII detection (Social Security #, credit card patterns)
+- Can be extended with Guardrails AI framework for structured validation
 
-`football_agent.py` and `baseball_agent.py` instantiate SQLite databases (`transfermarkt.db`, `lahman.db`) that don't exist on disk. Importing these modules at startup silently succeeds because SQLite creates the file on first connection. But executing the SQL agent would return empty results or errors because the schemas and data aren't populated. The stub routing that sends everything to the F1 agent is actually *protecting* users from hitting these broken agents.
+**Extensibility:**
+```python
+# Future: Add Guardrails AI for stricter output validation
+from guardrails import Guard, validators
+
+guard = Guard.from_string_validators(
+    validators=[
+        validators.ValidJSON(),
+        validators.ToxicLanguage(),
+        validators.PrivateKeyValidator()
+    ]
+)
+```
+
+### 5.3 Security Flow Diagram
+
+```mermaid
+graph LR
+    Q["User Query"] -->|input_guard| SG{"Is Safe?"}
+    SG -->|YES| Router["supervisor_router"]
+    SG -->|NO| OG["output_guard (blocked)"]
+    Router --> Sector["Sector Process"]
+    Sector -->|final_response| OG
+    OG -->|Contains PII?| CLIENT["Client Response"]
+```
 
 ---
 
-## Architecture Summary Diagram
+## 6. API Endpoints Summary
 
+### 6.1 POST /chat/stream
+**Purpose:** Primary streaming endpoint for agent queries
+
+**Request Body:**
+```json
+{
+    "query": "Who had the fastest lap at Monaco 2024?",
+    "user_role": "admin",
+    "thread_id": "550e8400-e29b-41d4-a716-446655440000"
+}
 ```
-+---------------------------------------------------------------+
-|                    Streamlit Frontend                         |
-|   st.session_state["token"] ---> login gate ---> chat UI     |
-+----------------------------+----------------------------------+
-                             | POST /chat (HTTP)
-+----------------------------v----------------------------------+
-|                   FastAPI Backend                             |
-|   /token (form auth) | /chat (ChatRequest -> invoke graph)   |
-+----------------------------+----------------------------------+
-                             | in-process invoke()
-+----------------------------v----------------------------------+
-|               LangGraph StateGraph                            |
-|                                                               |
-|   AgentState ---> supervisor_router() ---> f1_node() --> END  |
-|   (TypedDict)      (keyword match)         (active)           |
-|                        |                                      |
-|               soccer/baseball also wired --> f1_node (stubs) |
-+----------+---------------------------+------------------------+
-           |                           |
-+----------v----------+   +-----------v----------------------------+
-|   Groq LLM API      |   |      Neon PostgreSQL                   |
-|   gpt-oss-120b      |   |  f1_telemetry (PARTITION BY year)      |
-|   Call 1: parse     |   |  +-- f1_laps_2024                      |
-|   Call 2: respond   |   |  +-- f1_laps_2025                      |
-+---------------------+   |  +-- f1_laps_NNNN (on-demand DDL)     |
-                          +----------------------------------------+
-                                        ^
-                         +--------------+
-                         | cache miss only
-                   +-----v------------------+
-                   |   FastF1 API           |
-                   |   (official F1 data)   |
-                   |   ~3s per session load |
-                   +------------------------+
+
+**Response:** `text/event-stream` with SSE events
+```
+data: {"type":"update","timestamp":"2026-04-06T...","data":{"node":"extract","status":"executing"}}\n\n
+data: {"type":"message","timestamp":"2026-04-06T...","data":{"token":"Charles","is_final":false}}\n\n
+data: {"type":"message","timestamp":"2026-04-06T...","data":{"token":" Leclerc","is_final":false}}\n\n
+```
+
+### 6.2 POST /chat/resume
+**Purpose:** Resume paused graph after HITL approval
+
+**Request Body:**
+```json
+{
+    "thread_id": "550e8400-e29b-41d4-a716-446655440000",
+    "action": "approved"
+}
+```
+
+**Response:**
+```json
+{
+    "status": "success",
+    "final_response": "Charles Leclerc had the fastest lap..."
+}
+```
+
+### 6.3 POST /chat (Non-Streaming Fallback)
+**Purpose:** Synchronous endpoint for simple clients
+
+**Request Body:** Same as `/chat/stream`
+
+**Response:**
+```json
+{
+    "status": "success",
+    "response": "Charles Leclerc had the fastest lap...",
+    "query": "Who had the fastest lap at Monaco 2024?",
+    "timestamp": "2026-04-06T..."
+}
+```
+
+### 6.4 POST /token
+**Purpose:** OAuth2-style login (form-encoded)
+
+**Request:** `form-data: username=atharv_admin&password=nyu2025`
+
+**Response:**
+```json
+{
+    "access_token": "session_for_atharv_admin",
+    "token_type": "bearer"
+}
+```
+
+### 6.5 GET /health
+**Purpose:** Health check
+
+**Response:**
+```json
+{
+    "status": "healthy",
+    "timestamp": "2026-04-06T...",
+    "streaming_enabled": true
+}
 ```
 
 ---
 
-## File Manifest
+## 7. Key Design Decisions
 
-| File | Lines | Purpose |
-|---|---|---|
-| `main.py` | 61 | LangGraph router & orchestration |
-| `state.py` | 12 | Shared AgentState definition |
-| `backend.py` | 54 | FastAPI REST server |
-| `frontend.py` | 39 | Streamlit UI |
-| `f1_agent.py` | 140 | F1 domain agent (primary, fully implemented) |
-| `football_agent.py` | 20 | Soccer agent (stub — DB not present) |
-| `baseball_agent.py` | 15 | Baseball agent (stub — DB not present) |
-| `db_utils.py` | 46 | Database partitioning utilities |
-| `test_f1.py` | 25 | F1 agent unit test |
+### 7.1 Supervisor Router Pattern
+- **Why:** Multi-domain platform requires intent classification before processing
+- **Trade-off:** Extra LLM call (8B model) adds ~50-200ms latency, but ensures correctness
+
+### 7.2 SSE Dual-Stream
+- **Why:** Real-time UX requires both node progress (transparency) and token progress (responsiveness)
+- **Trade-off:** Client must handle two event types; simpler to debug than WebSocket
+
+### 7.3 Thread-based Memory
+- **Why:** Enables multi-turn conversations and HITL resumption without session overhead
+- **Trade-off:** MemorySaver is in-memory; doesn't survive app restart (can be swapped for PostgresSaver)
+
+### 7.4 Sector Subgraph Architecture
+- **Why:** Isolates domain logic (F1 vs Football vs Baseball); enables independent scaling
+- **Trade-off:** State must be managed across graph boundaries (AgentState bridge)
+
+### 7.5 HITL at API Boundary
+- **Why:** Prevents unintended API calls (cost control, compliance)
+- **Trade-off:** Breaks streaming flow; requires async client state management
+
+---
+
+## 8. Deployment Checklist
+
+- [ ] Environment variables: `GROQ_API_KEY`, `FOOTBALL_DATA_API_KEY`, database URLs
+- [ ] MemorySaver → PostgresSaver (production persistence)
+- [ ] Input/Output guardrails → integrate with Guardrails AI framework
+- [ ] CORS: update `allow_origins` from `localhost:5173` to production domain
+- [ ] Logging: rotate logs; disable debug prints in production
+- [ ] Rate limiting: add middleware for `/chat/stream` (prevent abuse)
+- [ ] Monitoring: add instrumentation for node execution times and LLM latency
+
+---
+
+## 9. Glossary
+
+| Term | Definition |
+|------|-----------|
+| **AgentState** | Global state dictionary flowing through all nodes |
+| **Thread ID** | Unique identifier for a conversation session; enables resumption |
+| **Checkpointer** | LangGraph component that saves/restores state at breakpoints |
+| **Supervisor Router** | LLM-based router that classifies intent and selects sector |
+| **Sector Subgraph** | Domain-specific graph (F1, Football, Baseball) executed as a node |
+| **SSE** | Server-Sent Events; one-way streaming protocol for real-time updates |
+| **HITL** | Human-in-the-Loop; requires user approval before high-cost actions |
+| **Interrupt** | LangGraph mechanism to pause execution at a checkpoint |
+| **Command(resume=...)** | LangGraph API to resume from an interrupt with a resume value |
+
+---
+
+## 10. Architecture Evolution Roadmap
+
+**Phase 1 (Current):**
+- MemorySaver (in-memory)
+- Llama Guard 2 (input only)
+- Single supervisor router
+- SSE dual-stream
+
+**Phase 2:**
+- PostgresSaver (persistent checkpoints)
+- Guardrails AI (structured output validation)
+- Tool-use routing (instead of LLM router)
+- WebSocket upgrade for lower latency
+
+**Phase 3:**
+- Multi-turn conversation memory
+- Long-context sector graphs (for multi-turn debugging)
+- Observability: Traces, Metrics, Logs
+- A/B testing framework for routing strategies

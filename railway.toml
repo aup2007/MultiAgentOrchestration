@@ -2,7 +2,7 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "uvicorn backend_streaming:backend --host 0.0.0.0 --port $PORT"
+startCommand = "uvicorn backend_streaming:app --host 0.0.0.0 --port $PORT"
 restartPolicyMaxRetries = 5
 restartPolicyWindowSeconds = 600
 healthchecks = {enabled = true, endpoint = "/health"}

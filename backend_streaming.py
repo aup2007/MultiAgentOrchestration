@@ -234,12 +234,12 @@ async def stream_chat_agentic(
                 for message_chunk in data:
                     token = None
 
-                    # Handle both AIMessageChunk (streaming tokens) and AIMessage (final output)
+                    # Only emit actual token chunks, skip AIMessage from finalize nodes
                     if isinstance(message_chunk, AIMessageChunk):
                         token = message_chunk.content
+                    # Skip AIMessage objects - they're from finalize nodes and will be in final_response
                     elif isinstance(message_chunk, AIMessage):
-                        # Support async finalize nodes that emit AIMessage
-                        token = getattr(message_chunk, 'content', None)
+                        continue
 
                     # Emit token event with deduplication to prevent stuttering
                     if token:

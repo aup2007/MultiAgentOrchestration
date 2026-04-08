@@ -1,1 +1,1 @@
-web: uvicorn backend_streaming:app --host 0.0.0.0 --port $PORT
+web: uvicorn backend:backend --host 0.0.0.0 --port $PORT

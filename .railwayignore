@@ -1,0 +1,14 @@
+.git
+.gitignore
+node_modules/
+twg-ui/
+*.pyc
+__pycache__
+.pytest_cache
+.env.local
+diagrams/
+*.png
+test_f1_agent.py
+test_f1.py
+reset_f1_db.py
+f1_columns.py

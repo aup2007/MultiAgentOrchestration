@@ -4,3 +4,5 @@
 .env.*
 ! .env.example
 ARCHITECTURE.md
+interview.md
+RAILWAY_DEPLOYMENT.md

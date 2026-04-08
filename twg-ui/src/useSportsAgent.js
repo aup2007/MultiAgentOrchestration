@@ -56,7 +56,7 @@ export function useSportsAgent() {
       return next;
     });
   };
-
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
   const streamChat = async (query) => {
     setError('');
     setIsStreaming(true);
@@ -71,7 +71,7 @@ export function useSportsAgent() {
     ]);
 
     try {
-      const response = await fetch('http://localhost:8000/chat/stream', {
+      const response = await fetch(`${BACKEND_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, user_role: 'admin', thread_id: threadId }),
@@ -174,7 +174,7 @@ export function useSportsAgent() {
     setIsStreaming(true);
 
     try {
-      const res = await fetch('http://localhost:8000/chat/resume', {
+      const res = await fetch(`${BACKEND_URL}/chat/resume`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

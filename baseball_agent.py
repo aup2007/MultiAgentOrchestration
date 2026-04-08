@@ -59,8 +59,8 @@ class BaseballSubState(TypedDict):
 load_dotenv()
 
 # === LLM & DB SETUP ===
-extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150, streaming=True)
-sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=True)
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=150, streaming=False)
+sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=False)
 synthesis_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, streaming=True)
 
 # Restrict the SQL Agent to ONLY the 5 Dodgers tables

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Use a faster, lighter model for routing (lower latency for classification)
 router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=20, streaming=True)
 # Note: llama-prompt-guard is a classification model and does NOT support streaming
-safety_checker = ChatGroq(model="meta-llama/llama-prompt-guard-2-22m", temperature=0)
+safety_checker = ChatGroq(model="meta-llama/llama-prompt-guard-2-22m", temperature=0, streaming=False)
 
 # Define valid sectors
 VALID_SECTORS = ["f1_sector", "football_sector", "baseball_sector"]

@@ -36,11 +36,11 @@ load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
 
-extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=100, streaming=True)
-sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=True)
+extract_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=100, streaming=False)
+sql_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1000, streaming=False)
 
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, streaming= True)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, streaming=True)
 f1_db = SQLDatabase(engine, include_tables=["f1_telemetry"])
 
 # Use the same SQL agent for querying

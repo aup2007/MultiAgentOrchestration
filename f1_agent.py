@@ -51,6 +51,21 @@ f1_sql_executor = create_sql_agent(
     verbose=False
 )
 
+def reinitialize_f1_db_and_executor():
+    """
+    Recreate the SQLDatabase and SQL agent after data sync.
+    Necessary because SQLDatabase caches schema info at initialization.
+    """
+    global f1_db, f1_sql_executor
+    refresh_sql_database_connection()
+    f1_db = SQLDatabase(engine, include_tables=["f1_telemetry"])
+    f1_sql_executor = create_sql_agent(
+        llm=sql_llm,
+        db=f1_db,
+        agent_type="openai-tools",
+        verbose=False
+    )
+
 
 @retry(
     wait=wait_exponential(multiplier=1, min=2, max=10), 
@@ -402,6 +417,9 @@ def f1_fetch_api_node(state: F1SubState) -> dict:
     try:
         sync_result = sync_telemetry_to_neon(year, location, "R")
         logger.info(f"Sync result: {sync_result}")
+
+        # Reinitialize SQLDatabase to clear cached schema and see new data
+        reinitialize_f1_db_and_executor()
 
         return {
             "db_query_result": "",  # Clear for next cycle

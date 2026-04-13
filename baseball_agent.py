@@ -94,6 +94,22 @@ baseball_sql_executor = create_sql_agent(
     verbose=False
 )
 
+def reinitialize_baseball_db_and_executor():
+    """
+    Recreate the SQLDatabase and SQL agent after data sync.
+    Necessary because SQLDatabase caches schema info at initialization.
+    """
+    global baseball_db, baseball_sql_executor
+    refresh_sql_database_connection()
+    baseball_db = SQLDatabase(engine, include_tables=dodgers_tables)
+    baseball_sql_executor = create_sql_agent(
+        llm=sql_llm,
+        db=baseball_db,
+        agent_type="openai-tools",
+        extra_tools = [read_init_db_schema],
+        verbose=False
+    )
+
 # === SAFE WRAPPERS ===
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
 def safe_extract_invoke(prompt_content: str):
@@ -379,6 +395,8 @@ def baseball_fetch_api_node(state: BaseballSubState) -> dict:
 
     try:
         sync_baseball_data_to_neon(year, category)
+        # Reinitialize SQLDatabase to clear cached schema and see new data
+        reinitialize_baseball_db_and_executor()
         return {"db_query_result": "", "data_synced": True, "fetch_attempts": fetch_attempts + 1}
     except Exception as e:
         return {"final_response": str(e), "data_synced": False, "fetch_attempts": fetch_attempts + 1}

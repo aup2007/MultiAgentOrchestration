@@ -5,6 +5,13 @@ from dotenv import load_dotenv
 load_dotenv()
 engine = create_engine(os.getenv("DATABASE_URL"))
 
+def refresh_sql_database_connection():
+    """
+    Flushes the engine's connection pool to ensure fresh connections see committed data.
+    Call this after syncing data to the database.
+    """
+    engine.dispose()
+
 def ensure_f1_partition(year: int, engine):
     """
     Checks Neon for the F1 infrastructure and creates 

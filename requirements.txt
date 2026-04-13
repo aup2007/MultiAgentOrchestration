@@ -19,3 +19,4 @@ httpx>=0.24.0
 groq>=0.5.0
 rich>=13.0.0
 python-multipart>=0.0.5
+langsmith>=0.1.0

@@ -16,7 +16,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from sqlalchemy import text
 from langchain_core.tools import tool
 # Import your database engine
-from db_utils import engine 
+from db_utils import engine, refresh_sql_database_connection 
 
 from rich.console import Console
 from rich.panel import Panel
@@ -204,7 +204,10 @@ def sync_baseball_data_to_neon(year: int, category: str) -> str:
         
         # Push to Neon Database
         df.to_sql(table_name, engine, if_exists='append', index=False, chunksize=500)
-        
+
+        # Flush connection pool to ensure fresh connections see committed data
+        refresh_sql_database_connection()
+
         msg = f"✅ Successfully synced {len(df)} {category} records for {year} LAD to Neon."
         # print(f">>> {msg}")
         log_node("PyBaseball Sync Success", msg, "green")

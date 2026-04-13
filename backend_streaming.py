@@ -170,7 +170,7 @@ async def stream_chat_agentic(
         SSE-formatted event strings
     """
     logger.info(f"Starting stream for query: {query[:50]}...")
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "run_name": f"TWG_Stream_{user_role}"}
 
     # Initialize graph state
     initial_state = {
@@ -410,7 +410,7 @@ async def chat_resume(request: Request) -> dict:
     # 2. Use the EXACT thread_id that was used in the /chat/stream endpoint
     # (Falling back to "session_user" just in case you are hardcoding it everywhere)
     thread_id = payload.get("thread_id", "session_user")
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "run_name": "TWG_Resumed_Execution"}
 
     try:
         resume_value = payload.get("action", "approved")

@@ -184,6 +184,8 @@ def sync_telemetry_to_neon(year: int, location: str, session_type: str) -> str:
                 index=False,
                 chunksize=500
             )
+            # Flush connection pool to ensure fresh connections see committed data
+            refresh_sql_database_connection()
             msg = f"✅ Successfully synced {year} {location} ({len(df_to_sync)} laps) to Neon."
             print(f">>> {msg}")
             return msg

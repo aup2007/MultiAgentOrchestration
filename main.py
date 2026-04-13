@@ -31,7 +31,6 @@ def parse_router_response(response_text: str) -> str:
     """
     response_text = response_text.strip()
 
-    # Try JSON parsing first
     try:
         parsed = json.loads(response_text)
         sector = parsed.get("sector", "").lower()
@@ -40,13 +39,11 @@ def parse_router_response(response_text: str) -> str:
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    # Try direct matching (lowercase)
     response_lower = response_text.lower()
     for sector in VALID_SECTORS:
         if response_lower == sector or response_lower.strip() == sector:
             return sector
 
-    # Log fallback and return default
     logger.warning(f"Failed to parse router response: {response_text}. Using fallback: {DEFAULT_SECTOR}")
     return DEFAULT_SECTOR
 
@@ -84,11 +81,8 @@ Output format: plain text sector name or JSON: {"sector": "sector_name"}"""
     router_user_prompt = f'Route this query to the appropriate sector: "{user_query}"'
 
     try:
-        # Make fast LLM call with strict parameters
+
         response = safe_route_invoke(router_system_prompt + "\n\n" + router_user_prompt)
-        # response = router_llm.invoke([
-        #     HumanMessage(content=router_system_prompt + "\n\n" + router_user_prompt)
-        # ]).content
 
         # Parse and validate response
         sector = parse_router_response(response)
@@ -96,7 +90,6 @@ Output format: plain text sector name or JSON: {"sector": "sector_name"}"""
         print(f">>> ROUTING TO: {sector}")
         return {
             "domain_detected": sector
-            # Don't add routing message to messages - prevents concatenation with final response
         }
 
     except Exception as e:

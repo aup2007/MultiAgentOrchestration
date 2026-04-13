@@ -86,22 +86,25 @@ def get_league_standings(league_name: str, season: int) -> str:
 
 
 @tool
-def get_team_matches(team_name: str, status: str = "FINISHED") -> str:
+def get_team_matches(team_name: str, status: str = "FINISHED", season: int = None) -> str:
     """
-    Fetches recent match history for a team (completed matches, upcoming matches, etc).
+    Fetches match history for a team (completed matches, upcoming matches, etc).
     Use this when the user asks about past games, last match, upcoming fixtures, etc.
 
     Args:
         team_name: Team name (e.g., "Chelsea")
         status: Match status - "FINISHED" (past games), "SCHEDULED" (upcoming), "IN_PLAY" (live)
+        season: Year/season to filter by (e.g., 2016, 2023). If None, returns most recent matches.
     """
-    print(f"\n>>> [API CALL] Fetching {status} matches for Chelsea (ID: 61)...")
+    print(f"\n>>> [API CALL] Fetching {status} matches for Chelsea (ID: 61)" + (f" from season {season}" if season else "..."))
 
     api_key = os.getenv("FOOTBALL_DATA_API_KEY")
     headers = {"X-Auth-Token": api_key}
 
     # 61 is Chelsea's exact ID. Fetch recent matches (completed, upcoming, or live)
     url = f"https://api.football-data.org/v4/teams/61/matches?status={status}&limit=10"
+    if season:
+        url += f"&season={season}"
 
     try:
         response = requests.get(url, headers=headers)
@@ -207,14 +210,16 @@ football_agent_executor = create_react_agent(
 def football_extract_node(state: FootballSubState) -> dict:
     print("\n--- NODE 1: Football Entity Extraction ---")
     query = state.get("query", "")
-    
+
     extraction_prompt = f"""
-    Analyze this Football (Soccer) query: "{query}"
-    Extract these entities:
-    - league (e.g., "Premier League")
-    - team (e.g., "Arsenal")
-    - year (Integer, default to 2026 if current/now is implied)
-    - is_live (Boolean: true if asking for a live score right now)
+    Analyze this Chelsea FC query: "{query}"
+    Extract:
+    - year (Integer ONLY if explicitly mentioned in the query, otherwise null. E.g., "2016", "2020", "2023")
+    - is_live (Boolean: true if asking for a live score right now, false otherwise)
+
+    CRITICAL: Only extract a year if the user explicitly mentions it.
+    Do NOT assume or default to a year.
+    Team is always Chelsea FC.
 
     Respond with ONLY a valid JSON object. No markdown, no notes.
     """

@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from state import AgentState
-from db_utils import engine, ensure_f1_partition
+from db_utils import engine, ensure_f1_partition, refresh_sql_database_connection
 from dotenv import load_dotenv
 import pandas as pd
 import fastf1
